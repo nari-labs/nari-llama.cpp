@@ -37,10 +37,14 @@ $Files = @{
 $Mmproj = @("Qwen3.8-27B-NariQ-mmproj-BF16.gguf", "8832425f593068d3278e08eda4c1591072c7a2d8dc90f21e4f86394e4b2eb002")
 
 $smi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
+$gpu = $null
 if ($smi) {
-    $gpu = (& nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader | Select-Object -First 1)
+    $gpu = (& nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>$null | Select-Object -First 1)
+    if ($LASTEXITCODE -ne 0) { $gpu = $null }
+}
+if ($gpu -and $gpu -match '^.+,\s*(\d+)\.\d+.*,') {
     Write-Host "GPU: $gpu"
-    $driver = [int](($gpu -split ", ")[1] -split "\.")[0]
+    $driver = [int]$Matches[1]
     if ($driver -lt 572) { throw "NVIDIA driver $driver is too old for CUDA $Cuda; install 572 or newer" }
 } else {
     Write-Warning "no NVIDIA GPU found; llama-server will run on the CPU, which is slow for a 27B model"

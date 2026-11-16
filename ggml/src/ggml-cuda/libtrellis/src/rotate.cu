@@ -21,7 +21,7 @@ constexpr int HADFULL_MAX = 24576;
 
 // ---- Paley matrices H_m (m = 12, 20, 68), built at compile time -----------------------------------------------------
 // H = I + S, S[0][j] = 1 and S[j][0] = -1 for j > 0, S[i][j] = chi(j - i) for i, j > 0, chi the quadratic character
-// mod q = m - 1 (docs/ptq.md, part 2a; trellis.HADAMARD_BASES).
+// mod q = m - 1 (nariq/FORMAT.md).
 struct Paley {
     signed char h[68 * 68];
 };

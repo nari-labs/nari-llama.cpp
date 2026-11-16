@@ -1,8 +1,7 @@
 // Shared helpers of libtrellis: errors, the trellis decode chain, small device utilities.
 //
-// The decode chain (Plan, windows, the INT8 grid as fp16 bit patterns) is ported from our consumer engine's sm_120
-// kernels (src/quantization/engine/csrc/trellis_mm.cu, versions 4 and 6; docs/consumer-engine.md, sections 12 and
-// 14), which match the format's reference decoder bit for bit.
+// The decode chain uses rolling windows and the INT8 grid represented as fp16 bit patterns.
+// See nariq/FORMAT.md for the tile layout.
 #pragma once
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

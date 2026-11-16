@@ -32,7 +32,7 @@ Apple GPU support requires dispatch for the trellis operations, 1-6-bit tile dec
 - Reject LoRA attachment to NariQ models rather than silently skipping adapter deltas or dereferencing a missing unbanded embedding.
 - Require supported format metadata and validate side descriptors before loading coded weights.
 - Reject Linux launcher use on unsupported operating systems and architectures before downloading model files.
-- Keep package builds independent of the quantization repository and record their source provenance.
+- Build packages from this checkout and record their source provenance.
 
 ## Further performance work
 

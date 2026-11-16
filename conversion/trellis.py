@@ -1,5 +1,4 @@
-"""trellis fork: GGUF from a native trellis export of Qwen3.5 / Qwen3.8 (docs/llamacpp.md in the quantization
-repository; the export's format is its FORMAT.md).
+"""NariQ GGUF conversion for Qwen3.5 / Qwen3.8. See nariq/FORMAT.md.
 
 Each coded linear `<module>.{trellis, block_scale, su, sv, row_scale}` becomes a `GGML_TYPE_TRL<k>` tensor (the codes,
 output-tile-major), its side tensors `<w>.trellis_{s16, pre, post}` (and `trellis_pin` / `trellis_pout` where

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Put the two upload sets together locally; nothing is uploaded (docs/llamacpp.md, "Release files").
+# Put the two upload sets together locally; nothing is uploaded (nariq/README.md).
 #
 #   assemble.sh page LINUX_DIR WINDOWS_DIR OUT   # the fork's release page: build_linux.sh's archives, the Windows
 #                                                # workflow's zips (its artifact, unzipped; "-" for none yet), run.sh,
@@ -20,35 +20,11 @@ prepare_out() {
     mkdir -p "$1"
 }
 
-verify() {  # dir: check the files a SHA256SUMS there lists (CRLF tolerated), print the checked names
-    local dir="$1"
-    [ -f "$dir/SHA256SUMS" ] || { echo "assemble.sh: no SHA256SUMS in $dir" >&2; exit 1; }
-    (cd "$dir" && tr -d '\r' < SHA256SUMS | sha256sum --quiet -c -) || { echo "assemble.sh: $dir does not match its SHA256SUMS" >&2; exit 1; }
-    tr -d '\r' < "$dir/SHA256SUMS" | sed 's/^[0-9a-f]\{64\}  //'
-}
 
 case "${1:-}" in
 page)
     [ $# -eq 4 ] || { echo "usage: assemble.sh page LINUX_DIR WINDOWS_DIR|- OUT" >&2; exit 2; }
-    linux="$2" windows="$3" out="$4"
-    prepare_out "$out"
-    files=($(verify "$linux"))
-    if [ "$windows" = - ]; then
-        echo "assemble.sh: Linux-only candidate; omitting run.ps1" >&2
-    else
-        files+=($(verify "$windows"))
-    fi
-    for f in "${files[@]}"; do
-        case "$f" in *"-$TAG-"*) ;; *) echo "assemble.sh: $f is not a $TAG file" >&2; exit 1 ;; esac
-        src="$linux/$f"; [ -f "$src" ] || src="$windows/$f"
-        cp -f "$src" "$out/$f"
-    done
-    cp -f "$HERE/run.sh" "$out/"
-    files+=(run.sh)
-    if [ "$windows" != - ]; then
-        cp -f "$HERE/run.ps1" "$out/"
-        files+=(run.ps1)
-    fi
+    exec python3 "$HERE/assemble_page.py" "$2" "$3" "$4"
     ;;
 models)
     [ $# -eq 3 ] || { echo "usage: assemble.sh models GGUF_DIR OUT" >&2; exit 2; }

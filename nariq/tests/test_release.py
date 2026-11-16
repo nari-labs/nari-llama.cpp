@@ -2,6 +2,8 @@ import functools
 import hashlib
 import http.server
 import io
+import json
+import zipfile
 import os
 from pathlib import Path
 import platform
@@ -53,9 +55,16 @@ class ReleaseTests(unittest.TestCase):
                  f"cudart-nari-llama.cpp-{self.tag}-{platform_name}-cuda-12.8-x64.{ext}"]
         lines = []
         for name in names:
-            data = name.encode()
-            (directory / name).write_bytes(data)
-            lines.append(f"{hashlib.sha256(data).hexdigest()}  {name}")
+            data = json.dumps({"revision": "a" * 40, "dirty": False}).encode()
+            if ext == "zip":
+                with zipfile.ZipFile(directory / name, "w") as archive:
+                    archive.writestr("build-info.json", data)
+            else:
+                with tarfile.open(directory / name, "w:gz") as archive:
+                    entry = tarfile.TarInfo(name.removesuffix(".tar.gz") + "/build-info.json")
+                    entry.size = len(data)
+                    archive.addfile(entry, io.BytesIO(data))
+            lines.append(f"{hashlib.sha256((directory / name).read_bytes()).hexdigest()}  {name}")
         (directory / "SHA256SUMS").write_bytes((("\r\n" if crlf else "\n").join(lines) + "\n").encode())
         return names
 
@@ -77,6 +86,23 @@ class ReleaseTests(unittest.TestCase):
         result = command("bash", str(RELEASE / "assemble.sh"), "page", str(linux), "-", str(out))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((out / "run.ps1").exists())
+
+    def test_assembly_rejects_incomplete_and_mixed_revision_archives(self):
+        linux, windows = self.root / "linux", self.root / "windows"
+        self.archives(linux, "linux")
+        names = self.archives(windows, "win")
+        program = windows / names[0]
+        with zipfile.ZipFile(program, "w") as archive:
+            archive.writestr("build-info.json", json.dumps({"revision": "b" * 40, "dirty": False}))
+        (windows / "SHA256SUMS").write_text("".join(f"{hashlib.sha256((windows / n).read_bytes()).hexdigest()}  {n}\n" for n in names))
+        mixed = command("bash", str(RELEASE / "assemble.sh"), "page", str(linux), str(windows), str(self.root / "out"))
+        self.assertNotEqual(mixed.returncode, 0)
+        self.assertIn("different source revisions", mixed.stderr)
+        lines = (linux / "SHA256SUMS").read_text().splitlines()
+        (linux / "SHA256SUMS").write_text(lines[0] + "\n")
+        missing = command("bash", str(RELEASE / "assemble.sh"), "page", str(linux), "-", str(self.root / "out"))
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("expected both", missing.stderr)
 
     def test_launcher_download_extract_hash_and_forward_arguments(self):
         web = self.root / "web"

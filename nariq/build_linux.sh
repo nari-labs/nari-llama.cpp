@@ -14,14 +14,15 @@ CUDA="$(nvcc --version | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p')"
 BUILD="${NARIQ_BUILD_DIR:-$ROOT/nariq-build/linux}"
 NAME="nari-llama.cpp-$TAG-bin-linux-cuda-$CUDA-x64"
 CUDART="cudart-nari-llama.cpp-$TAG-linux-cuda-$CUDA-x64"
-args=()
-if [ -n "${CUDA_ARCHS:-}" ]; then args+=("-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHS"); fi
+ARCHS="${CUDA_ARCHS:-50-virtual;61-virtual;70-virtual;75-virtual;80-virtual;86-real;89-real;90-virtual;120a-real}"
+args=("-DCMAKE_CUDA_ARCHITECTURES:STRING=$ARCHS")
+python3 "$HERE/prepare_ui.py"
 cmake -S "$ROOT" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_RPATH='$ORIGIN' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
     -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=ON \
     -DGGML_CUDA=ON -DGGML_CUDA_NCCL=OFF -DGGML_CUDA_CCCL_VERSION=v3.4.3 \
     -DLLAMA_BUILD_BORINGSSL=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
-    -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON "${args[@]}"
+    -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_USE_PREBUILT_UI=OFF "${args[@]}"
 cmake --build "$BUILD" -j "${JOBS:-4}"
 
 STAGE="$(mktemp -d)"

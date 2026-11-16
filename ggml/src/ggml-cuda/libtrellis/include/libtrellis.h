@@ -1,5 +1,4 @@
-// libtrellis: a standalone CUDA library that decodes the trellis-coded weights of our native checkpoints
-// (docs/libtrellis.md; the format: docs/ptq.md, "Native format", "Spec for a kernel author").
+// libtrellis: CUDA operations for NariQ trellis-coded weights. See nariq/FORMAT.md.
 //
 // A coded linear has N outputs and K inputs (W is N x K, y = W x, PyTorch's and ggml's orientation). Its weight is
 //
@@ -42,7 +41,7 @@ typedef enum { TQ_F32 = 0, TQ_BF16 = 1, TQ_F16 = 2 } tq_dtype;
 // stored as 16 k int16 (8 k little-endian 32-bit words) in exllamav3's packing and in-tile order. Tile (i, j) covers
 // inputs 16 i.. and outputs 16 j.. and starts at int16 offset (i * tile_stride_k + j * tile_stride_n) * 16 k.
 //   - the checkpoints' layout (exllamav3's `trellis` tensor, (K/16, N/16, 16 k)): tile_stride_k = N/16, tile_stride_n = 1;
-//   - output-tile-major ((N/16, K/16, 16 k), every 16 output rows contiguous: the GGUF layout of docs/libtrellis.md):
+//   - output-tile-major ((N/16, K/16, 16 k), every 16 output rows contiguous: the GGUF layout of nariq/FORMAT.md):
 //     tile_stride_k = 1, tile_stride_n = K/16.
 // tq_matrix_exl3 / tq_matrix_rows fill the struct for either.
 typedef struct {
@@ -150,7 +149,7 @@ int tq_rht(const float* x, int64_t x_stride, float* y, int64_t y_stride, int row
 // A whole-slice side (trellis.hadfull): the n entries are `nparts` fused parts in stored order, each cut in `shards`
 // equal contiguous shards; slice r is shard r of every part, side by side (one slice of all n when shards = 1). Each
 // slice of length L = n / shards = m 2^k (m the smallest of 1, 12, 20, 68 that leaves a power of two) is multiplied
-// by H_L = (H_m (x) H_2^k) / sqrt(L) (H_m the Paley matrices of docs/ptq.md, the base index the slow one).
+// by H_L = (H_m (x) H_2^k) / sqrt(L) (H_m the Paley matrices of nariq/FORMAT.md, the base index the slow one).
 // Forward (inverse = 0): y = post * H_L (pre * x) per slice; the input side's T x is pre = its signs, post null.
 // Inverse: y = post * H_L^T (pre * x) per slice; the output side's T^T x is pre null, post = its signs (times row
 // scales). pre / post: fp32 vectors of n entries in stored order, or null. L <= 24576. parts: host array of nparts

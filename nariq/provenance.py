@@ -1,4 +1,4 @@
-"""Record the checkout and source hashes without needing the quantization repo."""
+"""Record source hashes, revision and compiler settings for a runtime artifact."""
 import hashlib
 import json
 import os
@@ -8,6 +8,8 @@ import subprocess
 import sys
 
 root = Path(sys.argv[1]).resolve()
+source_dirs = ("app", "cmake", "common", "conversion", "ggml", "gguf-py/gguf", "include", "scripts", "src", "tools", "vendor", "nariq")
+root_files = ("CMakeLists.txt", "convert_hf_to_gguf.py", "LICENSE")
 
 
 def git(*args):
@@ -16,17 +18,19 @@ def git(*args):
 
 try:
     revision = git("rev-parse", "HEAD")
-    dirty = bool(git("status", "--porcelain", "--untracked-files=normal"))
+    dirty = bool(git("status", "--porcelain", "--untracked-files=no"))
+    untracked = git("ls-files", "--others", "--exclude-standard", "-z").split("\0")
+    dirty |= any(name in root_files or name.startswith(tuple(d + "/" for d in source_dirs)) for name in untracked)
 except (subprocess.CalledProcessError, FileNotFoundError):
     revision = os.environ.get("NARIQ_SOURCE_REVISION", "unknown")
     dirty = None
 
 sources = {}
-for directory in ("app", "cmake", "common", "conversion", "ggml", "gguf-py/gguf", "include", "src", "tools", "vendor", "nariq"):
+for directory in source_dirs:
     for path in sorted((root / directory).rglob("*")):
         if path.is_file() and "__pycache__" not in path.parts and "node_modules" not in path.parts:
             sources[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
-for filename in ("CMakeLists.txt", "convert_hf_to_gguf.py", "LICENSE"):
+for filename in root_files:
     sources[filename] = hashlib.sha256((root / filename).read_bytes()).hexdigest()
 builds = {}
 for directory in sys.argv[2:]:

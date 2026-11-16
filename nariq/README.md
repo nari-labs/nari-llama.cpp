@@ -54,7 +54,9 @@ docker buildx build -f nariq/Dockerfile --target artifacts \
 docker build -f nariq/Dockerfile -t nari-llama.cpp:local .
 ```
 
-The two archives contain programs/backends and CUDA runtime libraries, respectively. Both unpack into one directory. The program archive includes source revision, dirty status and source hashes in `build-info.json`, plus both licenses. `SHA256SUMS` covers both archives. Set `JOBS` to limit build parallelism; `CUDA_ARCHS` can reduce a development build's architecture set. A reduced-architecture build must not replace the all-architecture release candidate.
+The two archives contain programs/backends and CUDA runtime libraries, respectively. Both unpack into one directory. The program archive includes source revision, dirty status, source hashes and compiler/build settings in `build-info.json`, plus both licenses. `SHA256SUMS` covers both archives. Set `JOBS` to limit build parallelism; `CUDA_ARCHS` can reduce a development build's architecture set. A reduced-architecture build must not replace the all-architecture release candidate.
+
+The package build downloads the UI pinned in `ui.json`, checks its SHA256, and fails if it cannot supply the chat page. It does not fall back to a mutable `latest` UI.
 
 ## Windows archives
 
@@ -69,7 +71,7 @@ bash nariq/assemble.sh page linux-artifacts windows-artifacts candidate
 bash nariq/assemble.sh page linux-artifacts - candidate
 ```
 
-The assembler verifies input hashes, checks the candidate tag, and produces a combined checksum file plus `run.sh` and `run.ps1`. For a Linux-only candidate it omits `run.ps1`. Nothing is uploaded. The launchers' default download URLs will not work until the matching runtime release and model files are published. For local acceptance tests, `TRELLIS_RELEASE_URL` and `TRELLIS_MODEL_URL` can point to a local HTTP server.
+The assembler verifies input hashes, requires the program/runtime pairs from the same clean source revision, checks the candidate tag, and produces a combined checksum file plus `run.sh` and `run.ps1`. For a Linux-only candidate it omits `run.ps1`. Nothing is uploaded. The launchers' default download URLs will not work until the matching runtime release and model files are published. For local acceptance tests, `TRELLIS_RELEASE_URL` and `TRELLIS_MODEL_URL` can point to a local HTTP server.
 
 `run.sh` is Linux x86-64 only, and fits context to available GPU memory. It limits CPU threads in constrained containers because coded embeddings currently execute on CPU. `run.ps1` is the Windows x86-64 counterpart. Both pin the four model files by SHA256. Model file revisions and hashes remain unchanged by this integration.
 

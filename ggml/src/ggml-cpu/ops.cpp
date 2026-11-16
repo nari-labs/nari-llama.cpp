@@ -5401,7 +5401,7 @@ static void ggml_compute_forward_get_rows_f32(
 }
 
 // trellis fork: rows of a coded embedding (ggml_trellis_get_rows). The weight's tiles are output-tile-major (tile (i, J)
-// at (J (K/16) + i) 8 k words, docs/llamacpp.md); value (r, c) of a tile is its ring position p = 8 a + j with
+// at (J (K/16) + i) 8 k words, nariq/FORMAT.md); value (r, c) of a tile is its ring position p = 8 a + j with
 // a = 4 (r % 8) + (c % 8) / 2 and j = 4 (r / 8) + 2 (c / 8) + c % 2, decoded from the 16-bit window of the tile's
 // circular stream that ends at bit (p + 1) k (the INT8 grid of the native format, FORMAT.md). A row needs only its
 // own K windows, not its 16-row group.

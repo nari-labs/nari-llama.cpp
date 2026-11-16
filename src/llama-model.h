@@ -766,7 +766,7 @@ struct llama_hadamard {
     llama_hadamard_rotations inv; // latent lookup table -> inverse transform
 };
 
-// trellis fork: a trellis-coded weight's side tensors and sides (docs/llamacpp.md in the quantization repository)
+// trellis fork: a trellis-coded weight's side tensors and sides (nariq/FORMAT.md)
 struct llama_trellis_weight {
     ggml_tensor * s16  = nullptr; // F16 [K/16] block scales
     ggml_tensor * pre  = nullptr; // F32 [K] input-side vector

@@ -1,8 +1,8 @@
-# The llama.cpp trellis fork for Windows x86-64 with CUDA 12.8 (docs/llamacpp.md, "Release files"). The recipe is
+# The llama.cpp trellis fork for Windows x86-64 with CUDA 12.8 (nariq/README.md). The recipe is
 # upstream's release one, as two builds: everything but the CUDA backend with clang and every CPU variant
 # (windows-cpu), and ggml-cuda.dll with MSVC, nvcc and libtrellis (windows-cuda). The archives are kept as
 # workflow artifacts for 14 days; nothing is published. GitHub's runners have no GPU, so the smoke test covers loading
-# and the CPU backend only: a CUDA run needs a Windows machine with an NVIDIA card (docs/llamacpp.md, "Real cards").
+# and the CPU backend only: a CUDA run needs a Windows machine with an NVIDIA card (nariq/release-readiness.md).
 name: NariQ Windows artifacts
 
 on:
@@ -12,6 +12,9 @@ on:
 
 permissions:
   contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
 
 env:
   CUDA_DIR: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8
@@ -28,6 +31,9 @@ jobs:
       - name: Read package tag
         shell: bash
         run: echo "TAG=$(cat nariq/TAG)" >> "$GITHUB_ENV"
+
+      - name: Prepare pinned UI
+        run: python nariq/prepare_ui.py
 
       - name: CUDA 12.8 (NVIDIA's redistributable archives, sha256-checked)
         shell: pwsh
@@ -74,7 +80,7 @@ jobs:
           cmake -S . -B build-cpu -G "Ninja Multi-Config" -DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
             -DLLAMA_BUILD_BORINGSSL=ON -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON ^
             -DGGML_OPENMP=ON -DGGML_OPENMP_FETCH=ON -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=OFF ^
-            -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON
+            -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_USE_PREBUILT_UI=OFF
           if errorlevel 1 exit /b 1
           cmake --build build-cpu --config Release -j 3 --target llama-server llama-cli llama-bench llama-perplexity test-trellis test-trellis-metadata
           if errorlevel 1 exit /b 1
@@ -86,6 +92,7 @@ jobs:
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
           cmake -S . -B build-cuda -G "Ninja Multi-Config" -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF -DGGML_CPU=OFF ^
             -DGGML_CUDA=ON -DGGML_CUDA_CCCL_VERSION=v3.4.3 -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES:STRING="50-virtual;61-virtual;70-virtual;75-virtual;80-virtual;86-real;89-real;90-virtual;120a-real" ^
             -DGGML_CUDA_TRELLIS_DIR=%GITHUB_WORKSPACE:\=/%/ggml/src/ggml-cuda/libtrellis
           if errorlevel 1 exit /b 1
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
@@ -105,22 +112,15 @@ jobs:
           Copy-Item ggml\src\ggml-cuda\libtrellis\LICENSE "$name\LICENSE-libtrellis"
           python nariq/provenance.py . build-cpu build-cuda | Out-File -Encoding utf8 "$name\build-info.json"
           if ($LASTEXITCODE -ne 0) { throw "provenance failed" }
-          Copy-Item nariq\README-release.md "$name\README.md"
+          Copy-Item nariq\README-windows.md "$name\README.md"
           Copy-Item "$env:CUDA_DIR\bin\cudart64_*.dll", "$env:CUDA_DIR\bin\cublas64_*.dll", "$env:CUDA_DIR\bin\cublasLt64_*.dll" $cudart
           7z a "$name.zip" ".\$name\*" | Out-Null
           7z a "$cudart.zip" ".\$cudart\*" | Out-Null
           Get-FileHash "$name.zip", "$cudart.zip" -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } | Out-File -Encoding ascii SHA256SUMS
           Get-Content SHA256SUMS
 
-      - name: "Smoke test (no GPU on the runner: the CUDA backend must fail to load without breaking the CPU path)"
-        shell: pwsh
-        run: |
-          $dir = "nari-llama.cpp-$env:TAG-bin-win-cuda-12.8-x64"
-          Copy-Item "cudart-nari-llama.cpp-$env:TAG-win-cuda-12.8-x64\*" $dir
-          & "$dir\llama-server.exe" --version
-          if ($LASTEXITCODE -ne 0) { throw "llama-server --version failed" }
-          & "$dir\llama-cli.exe" --list-devices
-          if ($LASTEXITCODE -ne 0) { throw "llama-cli --list-devices failed" }
+      - name: Check the extracted final archives without a GPU
+        run: python nariq/smoke_package.py .
 
       - uses: actions/upload-artifact@v4
         with:

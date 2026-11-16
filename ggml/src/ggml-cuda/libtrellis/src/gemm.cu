@@ -1,6 +1,4 @@
-// libtrellis: the prefill GEMM (tq_gemm), any number of rows. The consumer engine's version 5, ported
-// (src/quantization/engine/csrc/trellis_mm.cu, trellis_pf_k and its tilings; transforms.cu, prologue_pf_k;
-// docs/consumer-engine.md, section 13), with any tile layout (tile strides), fp32 / BF16 / fp16 x and outputs, and
+// libtrellis prefill GEMM (tq_gemm), any number of rows, with tile strides, fp32 / BF16 / fp16 inputs and outputs, and
 // tq_gemv's pre, post and fused 128-point Hadamards. Whole-slice and larger rotations stay outside (tq_hadfull,
 // tq_rht).
 //

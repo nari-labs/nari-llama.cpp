@@ -1,9 +1,7 @@
 NariQ additions
 Copyright Nari Labs
 
-Imported from the Nari Labs quantization implementation at source commit 50e8130543255950ff2c21a41d81a9f966825b69.
-The imported patch SHA256 is 800504ce218a823ad81df6606728e7e24071513fba410594f43b0670fe4c9a1c.
-The imported NariQ additions are distributed under Apache-2.0 (nariq/LICENSE).
+The NariQ additions are distributed under Apache-2.0 (nariq/LICENSE).
 Upstream llama.cpp code remains under its MIT license (LICENSE).
 The vendored libtrellis copy also carries its Apache-2.0 LICENSE.
 

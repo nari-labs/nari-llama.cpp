@@ -1,8 +1,7 @@
 // libtrellis: the fused decode GEMV for 1-64 token rows (tq_gemv), sm_80+.
 //
-// Ported from our consumer engine's version 4/6 GEMM (src/quantization/engine/csrc/trellis_mm.cu, mm4_body;
-// docs/consumer-engine.md, sections 12 and 14), with three changes for a library: any tile layout (tile strides), the
-// activations prepared from fp32 / BF16 / fp16 x and the block scales by this library (no fused input transform), and
+// Supports tile strides and activations prepared from fp32 / BF16 / fp16 inputs and block scales.
+// The input transform is separate, and
 // the split reduction done by the last CTA to arrive (no reliance on the order CTAs are dispatched in).
 //
 // 1. Prepare (one warp per (row, 128 inputs)): u = x * s16, then fp16 in the m16n8k16 B-fragment order

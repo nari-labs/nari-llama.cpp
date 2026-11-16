@@ -5,6 +5,9 @@ on:
     paths: ['ggml/**', 'src/**', 'nariq/**', '.github/workflows/nariq-linux.yml']
 permissions:
   contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
 jobs:
   linux:
     runs-on: ubuntu-22.04
@@ -17,8 +20,7 @@ jobs:
       - name: Build archives without publishing
         run: docker buildx build -f nariq/Dockerfile --target artifacts --build-arg JOBS=3 --build-arg NARIQ_SOURCE_REVISION=${{ github.sha }} --output type=local,dest=nariq-dist .
       - name: Verify archives
-        working-directory: nariq-dist
-        run: sha256sum -c SHA256SUMS
+        run: python3 nariq/smoke_package.py nariq-dist
       - uses: actions/upload-artifact@v4
         with:
           name: nariq-linux-cuda

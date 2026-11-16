@@ -133,10 +133,8 @@ if (CUDAToolkit_FOUND)
                              ${GGML_SOURCES_CUDA}
                             )
 
-    # trellis fork: the coded linears (GGML_OP_TRELLIS) run through libtrellis, built here from its sources: the copy
-    # in ggml-cuda/libtrellis when there is one (nari-llama.cpp), else GGML_CUDA_TRELLIS_DIR (src/quantization/libtrellis
-    # in the quantization repository). It needs sm_80 or newer, so only those of the build's architectures are kept
-    # for it; with none, the coded linears run on the CPU.
+    # Build the vendored libtrellis, or the optional GGML_CUDA_TRELLIS_DIR override.
+    # Keep sm_80+ architectures; otherwise coded linears run on the CPU.
     set(TRELLIS_DEFAULT_DIR "")
     if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libtrellis/include/libtrellis.h")
         set(TRELLIS_DEFAULT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libtrellis")

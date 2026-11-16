@@ -1,5 +1,5 @@
-// trellis fork: host-side helpers for the trellis-coded weights (GGML_TYPE_TRL1..6; docs/llamacpp.md in the
-// quantization repository): the sides' transforms in libtrellis's conventions (tq_rht, tq_hadfull), the check of a
+// Host-side helpers for NariQ weights (GGML_TYPE_TRL1..6; nariq/FORMAT.md): transforms in libtrellis's
+// conventions (tq_rht, tq_hadfull), validation of a
 // coded weight's side description, the decode of 16-row groups and the dequantization of a whole coded linear.
 // Plain C++ without SIMD: the CPU backend's GGML_OP_TRELLIS uses the transforms (O(n log n) per column, small next to
 // the product) and has its own decode and product loops.
@@ -18,7 +18,7 @@ constexpr int TRL_MAX_PARTS = 8;
 
 // ---- Paley matrices H_m (m = 12, 20, 68), built at compile time, as libtrellis's rotate.cu ----------------------
 // H = I + S, S[0][j] = 1 and S[j][0] = -1 for j > 0, S[i][j] = chi(j - i) for i, j > 0, chi the quadratic character
-// mod q = m - 1 (docs/ptq.md, part 2a; trellis.HADAMARD_BASES).
+// mod q = m - 1 (nariq/FORMAT.md).
 struct trl_paley {
     signed char h[68 * 68];
 };
@@ -293,7 +293,7 @@ bool ggml_trellis_dequantize(enum ggml_type type, const void * data, int64_t K, 
         post == nullptr) {
         return false;
     }
-    // W = P_out diag(post) T_rows^T W^ T_cols diag(pre) P_in (y = W x for the op, docs/llamacpp.md)
+    // W = P_out diag(post) T_rows^T W^ T_cols diag(pre) P_in (y = W x for the op, nariq/FORMAT.md)
     ggml_trellis_decode_rows(type, data, K, 0, N, s16, out);
     const int64_t nmax = K > N ? K : N;
     std::vector<float> tmp(2 * nmax), row(K);

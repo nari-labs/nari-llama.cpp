@@ -1,5 +1,5 @@
-// trellis fork: the coded linear (GGML_OP_TRELLIS) on CUDA, through libtrellis (docs/llamacpp.md in the quantization
-// repository): the optional input gather, the input side (fused into the GEMV when it is 128-point blockwise), tq_gemv
+// NariQ coded linear (GGML_OP_TRELLIS) on CUDA through libtrellis (nariq/FORMAT.md):
+// optional input gather, input transform (fused into the GEMV for 128-point blocks), tq_gemv
 // for up to 64 columns or tq_gemm above, the output side and post, the optional output gather.
 #include "trellis.cuh"
 
@@ -74,7 +74,7 @@ bool ggml_cuda_trellis_supported(const ggml_tensor * op) {
     return x->nb[2] == x->nb[1] * x->ne[1] && x->nb[3] == x->nb[2] * x->ne[2] && ggml_is_contiguous(op);
 }
 
-// the op's side description (docs/llamacpp.md: trellis.desc) and shapes
+// the op's side description (nariq/FORMAT.md: trellis.desc) and shapes
 struct trellis_op {
     const ggml_tensor * w, * x, * s16, * pre, * post, * pin, * pout;
     int rows_kind, rows_block, rows_shards, cols_kind, cols_block, cols_shards, nparts;
