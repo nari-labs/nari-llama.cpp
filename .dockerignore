@@ -20,3 +20,6 @@ models/*
 arm_neon.h
 compile_commands.json
 Dockerfile
+
+nariq-build/
+nariq-dist/

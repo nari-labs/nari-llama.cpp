@@ -450,7 +450,28 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 op->type != GGML_TYPE_IQ2_S   &&
                 op->type != GGML_TYPE_IQ1_S   &&
                 op->type != GGML_TYPE_IQ1_M; // missing type_traits.from_float
+        case GGML_OP_TRELLIS:
+            {
+                // trellis fork: the coded linear (ops.cpp), reading the weight and its sides in host memory
+                const int32_t * desc = (const int32_t *) op->op_params;
+                if (!ggml_is_trellis_type(src0->type) || src1->type != GGML_TYPE_F32 || src1->nb[0] != sizeof(float) ||
+                    desc[6] < 0 || desc[6] > 8 ||
+                    !ggml_trellis_desc_supported(src0->ne[0], src0->ne[1], desc, 7 + desc[6])) {
+                    return false;
+                }
+                for (int i = 0; i < 7; i++) {
+                    if (i != 1 && op->src[i] && op->src[i]->buffer && !ggml_backend_buft_is_host(op->src[i]->buffer->buft)) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+        case GGML_OP_TRELLIS_GET_ROWS:
+            return src0->buffer == nullptr || ggml_backend_buft_is_host(src0->buffer->buft);
         case GGML_OP_MUL_MAT:
+            if (ggml_is_trellis_type(src0->type)) {
+                return false; // trellis fork: a coded weight is only read by GGML_OP_TRELLIS (no per-row vec_dot)
+            }
             if (ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
                 src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) {
                 return src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16;

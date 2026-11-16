@@ -260,7 +260,15 @@ extern "C" {
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
         GGML_TYPE_F8_E4M3 = 43,
-        GGML_TYPE_COUNT   = 44,
+        // trellis fork: trellis-coded weights at k = 1..6 bits (libtrellis; 16 x 16 tiles stored output-tile-major, so a
+        // block is 16 values of 2 k bytes and only 16-row-aligned row ranges are self-contained). Fork-only ids.
+        GGML_TYPE_TRL1    = 44,
+        GGML_TYPE_TRL2    = 45,
+        GGML_TYPE_TRL3    = 46,
+        GGML_TYPE_TRL4    = 47,
+        GGML_TYPE_TRL5    = 48,
+        GGML_TYPE_TRL6    = 49,
+        GGML_TYPE_COUNT   = 50,
     };
 
     // [TAG_GGML_PREC]
@@ -428,6 +436,9 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+
+        GGML_OP_TRELLIS,          // trellis fork: a coded linear (ggml_trellis_mul_mat)
+        GGML_OP_TRELLIS_GET_ROWS, // trellis fork: rows of a coded embedding (ggml_trellis_get_rows)
 
         GGML_OP_COUNT,
     };
@@ -1550,6 +1561,83 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // data
             struct ggml_tensor  * b); // row indices
+
+    // trellis fork: the coded linear of a trellis weight w (GGML_TYPE_TRL1..6, [K, N]) on x ([K, T, ...], F32):
+    //   y = gather_pout(post * T_rows^T(W^ T_cols(pre * gather_pin(x)))),   W^ = V * s16
+    // s16 F16 [K/16]; pre F32 [K]; post F32 [N]; pin I32 [K] and pout I32 [N] optional (NULL). desc: the sides,
+    // [rows_kind, rows_block, rows_shards, cols_kind, cols_block, cols_shards, nparts, parts...] (kind 0 none,
+    // 1 blockwise Hadamard of rows/cols_block, 2 whole-slice Hadamard; at most 8 parts). Result F32 [N, T, ...].
+    GGML_API struct ggml_tensor * ggml_trellis_mul_mat(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * s16,
+            struct ggml_tensor  * pre,
+            struct ggml_tensor  * post,
+            struct ggml_tensor  * pin,
+            struct ggml_tensor  * pout,
+            const int32_t       * desc,
+            int                   n_desc);
+
+    // trellis fork: rows ids of a coded embedding w ([K, N]: N rows of K values) in the original basis:
+    //   e_t = post[t] * pre * T_cols^T(s16 * v_t)        result F32 [K, n_ids]
+    GGML_API struct ggml_tensor * ggml_trellis_get_rows(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * s16,
+            struct ggml_tensor  * pre,
+            struct ggml_tensor  * post,
+            const int32_t       * desc,
+            int                   n_desc);
+
+    // trellis fork: one band of a coded embedding in frequency bands. Band w holds the rows [row0, row0 + w->ne[1]) of
+    // the banded order, gather ([n_vocab] I32) a token's position in it; the op writes the rows of the ids whose
+    // position lies in the band and leaves the others as they are, in place into prev (NULL: a new [K, n_ids] tensor).
+    // A chain over every band, each row0 the sum of the earlier bands' rows, writes every row once. row0 is op_params
+    // slot GGML_TRELLIS_BAND_ROW0, after the descriptor (at most 15 entries).
+#define GGML_TRELLIS_BAND_ROW0 15
+    GGML_API struct ggml_tensor * ggml_trellis_get_rows_band(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * prev,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * gather,
+            int64_t               row0,
+            struct ggml_tensor  * s16,
+            struct ggml_tensor  * pre,
+            struct ggml_tensor  * post,
+            const int32_t       * desc,
+            int                   n_desc);
+
+    GGML_API bool ggml_is_trellis_type(enum ggml_type type);
+
+    // trellis fork, host helpers (ggml-trellis.cpp). A coded weight has no per-row to_float: a nominal row's bytes are
+    // not that row's weights, only 16-row groups decode on their own, and the decode needs K. These take K instead.
+    //
+    // whether a side description (desc, n_desc as for ggml_trellis_mul_mat) is valid for a [K, N] coded weight
+    GGML_API bool ggml_trellis_desc_supported(int64_t K, int64_t N, const int32_t * desc, int n_desc);
+    // W^ = V * s16 (the rotated basis; s16 NULL: V) of the rows n0 .. n0 + n_rows - 1 (multiples of 16) of a coded
+    // weight with K inputs (data: its tiles, output-tile-major), row-major into out (n_rows x K)
+    GGML_API void ggml_trellis_decode_rows(enum ggml_type type, const void * data, int64_t K, int64_t n0, int64_t n_rows,
+                                           const ggml_fp16_t * s16, float * out);
+    // the whole coded linear's weight W in the original basis (y = W x for ggml_trellis_mul_mat), row-major N x K
+    // into out; host pointers (pin, pout may be NULL). false if desc is not valid.
+    GGML_API bool ggml_trellis_dequantize(enum ggml_type type, const void * data, int64_t K, int64_t N,
+                                          const ggml_fp16_t * s16, const float * pre, const float * post,
+                                          const int32_t * pin, const int32_t * pout, const int32_t * desc, int n_desc,
+                                          float * out);
+    // the sides' transforms on n floats in place, in libtrellis's conventions (tq_rht, tq_hadfull):
+    // the normalised blockwise Sylvester Hadamard (symmetric) of `block` (a power of two dividing n) entries
+    GGML_API void ggml_trellis_rht(float * v, int64_t n, int block);
+    // slice r of a whole-slice side: v[i] = post[i] * (H_L (pre * v))[i] over the slice's stored entries i (H_L^T if
+    // inverse), H_L = (H_m (x) H_2^j) / sqrt(L), L = n / shards = m 2^j with m in 1, 12, 20, 68; the n entries are
+    // nparts fused parts (parts NULL: one part), each cut in `shards` contiguous shards, and slice r is shard r of
+    // every part, side by side. pre, post may be NULL. tmp: 2 L floats. false if the shape is not valid.
+    GGML_API bool ggml_trellis_hadfull_slice(float * v, int64_t n, const int32_t * parts, int nparts, int shards, int r,
+                                             bool inverse, const float * pre, const float * post, float * tmp);
+    // m for a whole-slice Hadamard of len entries (the smallest of 1, 12, 20, 68 leaving a power of two), 0 if none
+    GGML_API int ggml_trellis_hadfull_m(int64_t len);
 
     GGML_API struct ggml_tensor * ggml_get_rows_back(
             struct ggml_context * ctx,

@@ -308,6 +308,11 @@ def main() -> None:
             if args.mtp:
                 model_class.mtp_only = True
 
+        # trellis fork: a native trellis export (quantization_config.quant_method native_trellis) of Qwen3.5 / 3.8
+        if (hparams.get("quantization_config") or {}).get("quant_method") == "native_trellis":
+            from conversion.trellis import TrellisQwen35Model
+            model_class = TrellisQwen35Model
+
         model_instance = model_class(dir_model, output_type, fname_out,
                                      is_big_endian=args.bigendian, use_temp_file=args.use_temp_file,
                                      eager=args.no_lazy,

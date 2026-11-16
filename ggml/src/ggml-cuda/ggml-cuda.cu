@@ -29,6 +29,7 @@
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fp8.cuh"
 #include "ggml-cuda/fwht.cuh"
+#include "ggml-cuda/trellis.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
@@ -2830,6 +2831,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     return false;
             }
             break;
+        case GGML_OP_TRELLIS:
+            ggml_cuda_op_trellis(ctx, dst);
+            break;
         case GGML_OP_GLU:
             switch (ggml_get_glu_op(dst)) {
                 case GGML_GLU_OP_REGLU:
@@ -4341,6 +4345,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // trellis fork: an MLP's up/gate, swiglu and down as one chain; consecutive coded linears of one x as an input group
+    if (node->op == GGML_OP_TRELLIS && cuda_ctx->stream_context().concurrent_events.empty()) {
+        if (ggml_cuda_trellis_mlp_chain(cgraph, i) == 4) {
+            ggml_cuda_op_trellis_mlp_chain(*cuda_ctx, cgraph->nodes + i);
+            return 3;
+        }
+        const int n = ggml_cuda_trellis_group_size(cgraph, i);
+        if (n > 1) {
+            int outputs[8];
+            for (int j = 0; j < n; ++j) {
+                outputs[j] = i + j;
+            }
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, n, outputs, n)) {
+                ggml_cuda_op_trellis_group(*cuda_ctx, cgraph->nodes + i, n);
+                return n - 1;
+            }
+        }
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
@@ -6256,11 +6279,19 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 default:
                     return false;
             }
+        case GGML_OP_TRELLIS:
+            // trellis fork: libtrellis's GEMV / GEMM need sm_80+ (the loader probes this op for a coded weight)
+            return ggml_cuda_trellis_supported(op) && ggml_cuda_info().devices[dev_ctx->device].cc >= GGML_CUDA_CC_AMPERE;
+        case GGML_OP_TRELLIS_GET_ROWS:
+            return false; // trellis fork: the coded embedding stays in host memory (CPU op)
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             {
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
+                if (ggml_is_trellis_type(a->type)) {
+                    return false; // trellis fork: a coded weight is only ever read by GGML_OP_TRELLIS
+                }
                 if (a->nb[0] != ggml_element_size(a) || b->nb[0] != ggml_element_size(b)) {
                     return false; // TODO this could in principle be implemented though currently there is no use case.
                 }

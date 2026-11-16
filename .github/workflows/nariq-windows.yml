@@ -1,0 +1,122 @@
+# The llama.cpp trellis fork for Windows x86-64 with CUDA 12.8 (docs/llamacpp.md, "Release files"). The recipe is
+# upstream's release one, as two builds: everything but the CUDA backend with clang and every CPU variant
+# (windows-cpu), and ggml-cuda.dll with MSVC, nvcc and libtrellis (windows-cuda). The archives are kept as
+# workflow artifacts for 14 days; nothing is published. GitHub's runners have no GPU, so the smoke test covers loading
+# and the CPU backend only: a CUDA run needs a Windows machine with an NVIDIA card (docs/llamacpp.md, "Real cards").
+name: NariQ Windows artifacts
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths: ['ggml/**', 'src/**', 'nariq/**', '.github/workflows/nariq-windows.yml']
+
+permissions:
+  contents: read
+
+env:
+  CUDA_DIR: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8
+
+jobs:
+  windows:
+    runs-on: windows-2022  # CUDA 12.8 supports Visual Studio 2022's MSVC, not 2026's
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read package tag
+        shell: bash
+        run: echo "TAG=$(cat nariq/TAG)" >> "$GITHUB_ENV"
+
+      - name: CUDA 12.8 (NVIDIA's redistributable archives, sha256-checked)
+        shell: pwsh
+        run: |
+          $base = "https://developer.download.nvidia.com/compute/cuda/redist"
+          $parts = @(
+            @("cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.8.90-archive.zip", "4a39058fd8519444a81cfc7ae055d136f48d1a31ffa41ae255b35b2edd61e13b"),
+            @("cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-12.8.93-archive.zip", "9fdc70b4271ed9aad4d64cd7076a7d96ec36512d074b9995fe638de669197391"),
+            @("cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-12.8.93-archive.zip", "a63302a077f0248a743a1a7caa7dbd80d0fac56c6cfa9c41fa05fac9b7e5eda5"),
+            @("libcublas/windows-x86_64/libcublas-windows-x86_64-12.8.4.1-archive.zip", "57a470112cec7e112c95253dde8b3c7184d795dbd92b0bde77a4cb7f8c94c8aa"),
+            @("cuda_nvtx/windows-x86_64/cuda_nvtx-windows-x86_64-12.8.90-archive.zip", "38dbd5941537fcb359137f26fe31b4e3528c504cc2a55fa10a9baaf0ff006187"),
+            @("cuda_profiler_api/windows-x86_64/cuda_profiler_api-windows-x86_64-12.8.90-archive.zip", "0a9d628d2582bd58c78ba92827cd9613d62790924cde1178719f677fc03b6ee2"),
+            @("visual_studio_integration/windows-x86_64/visual_studio_integration-windows-x86_64-12.8.90-archive.zip", "f41d12a0e49b7848ed35e8a15b58926b83f635c723cab7e9952bc633e3c1f200"),
+            @("cuda_cccl/windows-x86_64/cuda_cccl-windows-x86_64-12.8.90-archive.zip", "bd8548fa1ae82f92910bebc3079e14bd58c5a92aa64596d46bd610a478cb39d7"))
+          New-Item -ItemType Directory -Force -Path $env:CUDA_DIR | Out-Null
+          foreach ($p in $parts) {
+            $zip = Split-Path $p[0] -Leaf
+            curl.exe -fsSL -o $zip "$base/$($p[0])"
+            if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() -ne $p[1]) { throw "$zip does not match its sha256" }
+            7z x $zip -o"cuda-parts" -y | Out-Null
+            Copy-Item -Recurse -Force "cuda-parts\$($zip -replace '\.zip$','')\*" $env:CUDA_DIR
+          }
+          "$env:CUDA_DIR\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "CUDA_PATH=$env:CUDA_DIR" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Ninja
+        run: choco install ninja -y
+
+      - name: Programs and CPU backends (clang, every x86-64 CPU variant)
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build-cpu -G "Ninja Multi-Config" -DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
+            -DLLAMA_BUILD_BORINGSSL=ON -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DGGML_OPENMP=ON -DGGML_OPENMP_FETCH=ON -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=OFF ^
+            -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON
+          if errorlevel 1 exit /b 1
+          cmake --build build-cpu --config Release -j 3 --target llama-server llama-cli llama-bench llama-perplexity test-trellis test-trellis-metadata
+          if errorlevel 1 exit /b 1
+          ctest --test-dir build-cpu -C Release --output-on-failure -R test-trellis
+
+      - name: CUDA backend with libtrellis (MSVC + nvcc)
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build-cuda -G "Ninja Multi-Config" -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF -DGGML_CPU=OFF ^
+            -DGGML_CUDA=ON -DGGML_CUDA_CCCL_VERSION=v3.4.3 -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_CUDA_TRELLIS_DIR=%GITHUB_WORKSPACE:\=/%/ggml/src/ggml-cuda/libtrellis
+          if errorlevel 1 exit /b 1
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build-cuda --config Release -j %NINJA_JOBS% --target ggml-cuda
+
+      - name: Pack
+        shell: pwsh
+        run: |
+          $name = "nari-llama.cpp-$env:TAG-bin-win-cuda-12.8-x64"
+          $cudart = "cudart-nari-llama.cpp-$env:TAG-win-cuda-12.8-x64"
+          New-Item -ItemType Directory -Force -Path $name, $cudart | Out-Null
+          Copy-Item build-cpu\bin\Release\* $name
+          Copy-Item build-cuda\bin\Release\ggml-cuda.dll $name
+          Copy-Item LICENSE $name
+          Copy-Item nariq\LICENSE "$name\LICENSE-NariQ"
+          Copy-Item nariq\NOTICE "$name\NOTICE-NariQ"
+          Copy-Item ggml\src\ggml-cuda\libtrellis\LICENSE "$name\LICENSE-libtrellis"
+          python nariq/provenance.py . | Out-File -Encoding utf8 "$name\build-info.json"
+          if ($LASTEXITCODE -ne 0) { throw "provenance failed" }
+          Copy-Item nariq\README-release.md "$name\README.md"
+          Copy-Item "$env:CUDA_DIR\bin\cudart64_*.dll", "$env:CUDA_DIR\bin\cublas64_*.dll", "$env:CUDA_DIR\bin\cublasLt64_*.dll" $cudart
+          7z a "$name.zip" ".\$name\*" | Out-Null
+          7z a "$cudart.zip" ".\$cudart\*" | Out-Null
+          Get-FileHash "$name.zip", "$cudart.zip" -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } | Out-File -Encoding ascii SHA256SUMS
+          Get-Content SHA256SUMS
+
+      - name: "Smoke test (no GPU on the runner: the CUDA backend must fail to load without breaking the CPU path)"
+        shell: pwsh
+        run: |
+          $dir = "nari-llama.cpp-$env:TAG-bin-win-cuda-12.8-x64"
+          Copy-Item "cudart-nari-llama.cpp-$env:TAG-win-cuda-12.8-x64\*" $dir
+          & "$dir\llama-server.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "llama-server --version failed" }
+          & "$dir\llama-cli.exe" --list-devices
+          if ($LASTEXITCODE -ne 0) { throw "llama-cli --list-devices failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nari-llama.cpp-windows
+          path: |
+            nari-llama.cpp-*-bin-win-cuda-12.8-x64.zip
+            cudart-nari-llama.cpp-*-win-cuda-12.8-x64.zip
+            SHA256SUMS
+          retention-days: 14
+          if-no-files-found: error

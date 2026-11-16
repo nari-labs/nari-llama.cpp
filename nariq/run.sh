@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# Run Qwen3.8-27B trellis on an NVIDIA GPU with one command (Linux x86-64): downloads the llama.cpp trellis fork's
+# binaries and CUDA runtime, the GGUF and the vision projector once, checks each file's sha256, and starts
+# llama-server with an OpenAI-compatible API and a chat page at http://127.0.0.1:8080.
+#
+#   ./run.sh                    # the 3-bit file, with vision, the longest context the GPU's free memory holds
+#   ./run.sh 2.5                # the 2.5-bit file (2.0: the 2-bit one); 3bit / 2.5bit / 2bit work too
+#   ./run.sh 3.0 --docker       # the same through the Docker image (needs the NVIDIA Container Toolkit)
+#   ./run.sh 3.0 --no-vision -- -np 4 -c 131072    # arguments after -- go to llama-server unchanged
+#
+# Options: --port N (8080), --host ADDR (127.0.0.1), --no-vision, --docker, --download-only.
+# Environment: TRELLIS_HOME (download folder, ~/.cache/nari-llama.cpp); TRELLIS_RELEASE_URL, TRELLIS_MODEL_URL,
+# TRELLIS_IMAGE and TRELLIS_TAG (mirrors and tests). Needs curl, tar, sha256sum, an NVIDIA driver of 570 or newer
+#, glibc 2.34 or newer and libgomp (Ubuntu 22.04, Debian 12, RHEL 9 or newer). Without a
+# GPU it runs on the CPU, slowly.
+set -euo pipefail
+
+if [ "${BASH_VERSINFO[0]}" -lt 4 ] || [ "$(uname -s)" != Linux ] || [ "$(uname -m)" != x86_64 ]; then
+    echo "run.sh requires Linux x86-64 and Bash 4+. See nariq/README.md for source builds on other platforms." >&2
+    exit 2
+fi
+
+TAG="${TRELLIS_TAG:-b12431-nari2}"   # the release tag (nari-labs/nari-llama.cpp)
+RELEASE_URL="${TRELLIS_RELEASE_URL:-https://github.com/nari-labs/nari-llama.cpp/releases/download/$TAG}"
+MODEL_URL="${TRELLIS_MODEL_URL:-https://huggingface.co/nari-labs/Qwen3.8-27B-NariQ-GGUF/resolve/main}"
+IMAGE="${TRELLIS_IMAGE:-ghcr.io/nari-labs/nari-llama.cpp:$TAG}"
+HOME_DIR="${TRELLIS_HOME:-$HOME/.cache/nari-llama.cpp}"
+CUDA=12.8
+
+# file, size in bytes and sha256 per budget; the layout of these files is frozen
+declare -A FILE=([3.0]=Qwen3.8-27B-NariQ-3bit.gguf [2.5]=Qwen3.8-27B-NariQ-2.5bit.gguf [2.0]=Qwen3.8-27B-NariQ-2bit.gguf)
+declare -A SIZE=([3.0]=10123626592 [2.5]=8443119712 [2.0]=6753954304)
+declare -A SHA=([3.0]=1eaad934aa05579b8eba47ed9b26450392f9875fc2354efe8cfa8b29be8f4419
+                [2.5]=2445372e6de20620b940fbfab53aa718af9ba741f202da30cd2f02b5df78d05c
+                [2.0]=3a9e4955329dba8ba0be5509a9552220e5ccdae2f66bcc72c21c4580cd49bbb2)
+MMPROJ=Qwen3.8-27B-NariQ-mmproj-BF16.gguf
+MMPROJ_SHA=8832425f593068d3278e08eda4c1591072c7a2d8dc90f21e4f86394e4b2eb002
+
+budget=3.0 port=8080 host=127.0.0.1 vision=1 docker=0 download_only=0
+extra=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        3.0|2.5|2.0) budget="$1" ;;
+        3bit|2.5bit|2bit) budget="${1%bit}"; [ "$budget" = 3 ] && budget=3.0; [ "$budget" = 2 ] && budget=2.0 ;;
+        --port|--host)
+            [ $# -ge 2 ] && [ -n "$2" ] || { echo "run.sh: $1 requires a value" >&2; exit 2; }
+            if [ "$1" = --port ]; then port="$2"; else host="$2"; fi
+            shift ;;
+        --no-vision) vision=0 ;;
+        --docker) docker=1 ;;
+        --download-only) download_only=1 ;;
+        --) shift; extra=("$@"); break ;;
+        -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "run.sh: unknown argument '$1' (see --help)" >&2; exit 2 ;;
+    esac
+    shift
+done
+for tool in curl tar sha256sum; do
+    command -v "$tool" > /dev/null || { echo "run.sh: needs $tool" >&2; exit 2; }
+done
+
+if command -v nvidia-smi > /dev/null && gpu="$(nvidia-smi --query-gpu=name,driver_version,memory.total \
+        --format=csv,noheader 2> /dev/null | head -n 1)" && [ -n "$gpu" ]; then
+    driver="${gpu#*, }"; driver="${driver%%.*}"
+    echo "GPU: $gpu"
+    if [ "$driver" -lt 570 ]; then
+        echo "run.sh: NVIDIA driver $driver is too old for CUDA $CUDA; install 570 or newer" >&2
+        exit 2
+    fi
+else
+    echo "run.sh: no NVIDIA GPU found; llama-server will run on the CPU, which is slow for a 27B model" >&2
+fi
+
+fetch() {  # url, path, sha256: download once (resuming a partial file), then check
+    local url="$1" path="$2" sha="$3"
+    if [ -f "$path" ] && [ -f "$path.ok" ]; then return 0; fi
+    mkdir -p "$(dirname "$path")"
+    echo "downloading $(basename "$path")"
+    curl -fL -# --retry 5 --retry-delay 3 -C - -o "$path.part" "$url"
+    echo "checking $(basename "$path")"
+    if [ "$(sha256sum "$path.part" | cut -d' ' -f1)" != "$sha" ]; then
+        rm -f "$path.part"
+        echo "run.sh: $(basename "$path") does not match its sha256; deleted, run again to download it again" >&2
+        exit 1
+    fi
+    mv "$path.part" "$path" && touch "$path.ok"
+}
+
+fetch "$MODEL_URL/${FILE[$budget]}" "$HOME_DIR/models/${FILE[$budget]}" "${SHA[$budget]}"
+[ "$vision" = 1 ] && fetch "$MODEL_URL/$MMPROJ" "$HOME_DIR/models/$MMPROJ" "$MMPROJ_SHA"
+
+# llama.cpp starts a thread per core of the whole machine, even where this process may use fewer CPUs (a cpuset or a
+# CPU quota, as in containers); the coded embedding's CPU ops then wait on descheduled threads at every token, which
+# slowed the 2-bit file's generation 4x on some hosts. Pass the CPUs this process has when they are fewer.
+cpus="$(nproc)"
+if [ -r /sys/fs/cgroup/cpu.max ] && read -r quota period < /sys/fs/cgroup/cpu.max && [ "$quota" != max ]; then
+    quota=$(( (quota + period - 1) / period ))
+    [ "$quota" -lt "$cpus" ] && cpus="$quota"
+fi
+threads=()
+case " ${extra[*]} " in
+    *" -t "*|*" --threads "*) ;;
+    *) [ "$cpus" -lt "$(getconf _NPROCESSORS_ONLN)" ] && threads=(-t "$cpus") ;;
+esac
+
+if [ "$docker" = 1 ]; then
+    [ "$download_only" = 1 ] && { docker pull "$IMAGE"; exit 0; }
+    args=(-m "/models/${FILE[$budget]}" "${threads[@]}")
+    [ "$vision" = 1 ] && args+=(--mmproj "/models/$MMPROJ" --fit-target 2560)
+    echo "starting $IMAGE on http://$host:$port"
+    exec docker run --rm --gpus all -p "$host:$port:8080" -v "$HOME_DIR/models:/models:ro" "$IMAGE" \
+        "${args[@]}" --host 0.0.0.0 --port 8080 "${extra[@]}"
+fi
+
+bin="$HOME_DIR/bin/$TAG"
+if [ ! -x "$bin/llama-server" ]; then
+    name="nari-llama.cpp-$TAG-bin-linux-cuda-$CUDA-x64"
+    cudart="cudart-nari-llama.cpp-$TAG-linux-cuda-$CUDA-x64"
+    mkdir -p "$HOME_DIR/downloads"
+    curl -fsSL --retry 5 -o "$HOME_DIR/downloads/SHA256SUMS-$TAG" "$RELEASE_URL/SHA256SUMS"
+    for archive in "$name" "$cudart"; do
+        sha="$(sed -n "s/^\([0-9a-f]\{64\}\)  $archive.tar.gz$/\1/p" "$HOME_DIR/downloads/SHA256SUMS-$TAG")"
+        [ -n "$sha" ] || { echo "run.sh: $archive.tar.gz is not in the release's SHA256SUMS" >&2; exit 1; }
+        fetch "$RELEASE_URL/$archive.tar.gz" "$HOME_DIR/downloads/$archive.tar.gz" "$sha"
+    done
+    rm -rf "$bin.part" && mkdir -p "$bin.part"
+    tar -xzf "$HOME_DIR/downloads/$name.tar.gz" -C "$bin.part" --strip-components=1
+    tar -xzf "$HOME_DIR/downloads/$cudart.tar.gz" -C "$bin.part" --strip-components=1
+    rm -rf "$bin" && mv "$bin.part" "$bin"
+fi
+[ "$download_only" = 1 ] && exit 0
+
+args=(-m "$HOME_DIR/models/${FILE[$budget]}" "${threads[@]}")
+# the projector is loaded after the context is fitted to free memory: keep room for it and its image batch
+[ "$vision" = 1 ] && args+=(--mmproj "$HOME_DIR/models/$MMPROJ" --fit-target 2560)
+echo "starting llama-server ($budget) on http://$host:$port"
+exec "$bin/llama-server" "${args[@]}" --host "$host" --port "$port" "${extra[@]}"

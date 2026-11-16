@@ -1,0 +1,29 @@
+name: NariQ CPU checks
+on:
+  pull_request:
+  push:
+    branches: [master, 'codex/**']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  cpu:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Configure CPU backend
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF -DGGML_METAL=OFF -DGGML_NATIVE=OFF -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=OFF
+      - name: Build
+        run: cmake --build build --config Release -j 3 --target llama-server test-trellis test-trellis-metadata test-gguf test-quantize-fns test-chat test-grammar-parser test-sampling
+      - name: Test NariQ operations and model-independent regressions
+        run: ctest --test-dir build --output-on-failure -R 'test-(trellis|trellis-metadata|gguf|quantize-fns|chat|grammar-parser|sampling)$'
+      - name: Packaging and launcher checks
+        run: python3 -m unittest discover -s nariq/tests -v
+      - name: Server starts without a model
+        run: build/bin/llama-server --version

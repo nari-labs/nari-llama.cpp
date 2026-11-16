@@ -1130,6 +1130,9 @@ struct llm_graph_context {
               ggml_tensor * cur,
               ggml_tensor * w_s = nullptr) const;
 
+    // trellis fork: the logits of a coded lm_head in frequency bands (llama_trellis::bands)
+    ggml_tensor * build_trellis_bands(ggml_tensor * cur) const;
+
     // do mat_mul_id, while optionally apply lora and per-expert scale
     // if slots is set, the experts are selected by slots instead of ids, from the MoE cache if cached (see llama_moe_cache::build_lookup)
     ggml_tensor * build_lora_mm_id(

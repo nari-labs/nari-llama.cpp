@@ -1,0 +1,678 @@
+// libtrellis: the fused decode GEMV for 1-64 token rows (tq_gemv), sm_80+.
+//
+// Ported from our consumer engine's version 4/6 GEMM (src/quantization/engine/csrc/trellis_mm.cu, mm4_body;
+// docs/consumer-engine.md, sections 12 and 14), with three changes for a library: any tile layout (tile strides), the
+// activations prepared from fp32 / BF16 / fp16 x and the block scales by this library (no fused input transform), and
+// the split reduction done by the last CTA to arrive (no reliance on the order CTAs are dispatched in).
+//
+// 1. Prepare (one warp per (row, 128 inputs)): u = x * s16, then fp16 in the m16n8k16 B-fragment order
+//    ([128-block c][row group r][k-tile][token g][16 halves], frag_pos) with one power-of-two scale per (row, block):
+//    2^e with max |u| 2^e in [2^13, 2^14), and the block's sum of its fp16 values.
+// 2. GEMV: a CTA owns 8 output tiles (128 outputs) over one split of the inputs. Per chunk of 8 k-tiles (128 inputs,
+//    one activation scale), cp.async stages the warps' code words and the chunk's activations of every row group into
+//    shared memory, S chunks ahead. Each warp decodes its tile once into an A fragment holding 4 v + 1528 (exact in
+//    fp16) and multiplies it with each row group's B fragment; per chunk, acc += (product - 1528 sum) 2^-e.
+// 3. Reduction: each split writes fp32 partials to the workspace; the last CTA of a column block to arrive sums them in
+//    split order (deterministic), applies 1/4, the optional output Hadamard and post, and stores out.
+#include <cuda_bf16.h>
+
+#include <cstdio>
+
+#include "common.cuh"
+
+namespace {
+
+constexpr int W4 = 8;   // warps = output tiles per CTA
+constexpr int C4 = 8;   // k-tiles per chunk (128 inputs)
+constexpr int MAX_ROWS = 64;
+
+template <int K, int RM>
+__host__ __device__ constexpr int stage_words() {
+    return W4 * C4 * 8 * K + RM * (C4 * 64 + 16);  // codes [warp][tile][8K]; acts [group][tile][64]; scales and sums
+}
+
+// Occupancy plan (the engine's): the most CTAs per SM (4 for 1-2 row groups, whose registers fit 64 per thread; else
+// 2) whose shared memory fits 100 KB per SM with 2-4 chunk stages, and the most stages at that count. 100 KB is
+// sm_86/89/120's per-SM shared memory; sm_80/90 have more.
+template <int K, int RM>
+struct Occ {
+    static constexpr int STAGE_BYTES = stage_words<K, RM>() * 4;
+    static constexpr int bytes(int s) { return (s * STAGE_BYTES + 16 + 255) / 256 * 256 + 1024; }
+    static constexpr int fit(int ctas) {
+        for (int s = 4; s >= 2; --s)
+            if (ctas * bytes(s) <= 102400) return s;
+        return 0;
+    }
+    static constexpr int CTAS = RM >= 4 ? 2 : (fit(4) ? 4 : (fit(3) ? 3 : 2));
+    static constexpr int S = fit(CTAS) ? fit(CTAS) : 2;
+    static constexpr int SMEM = S * STAGE_BYTES;
+};
+
+struct Args {
+    const uint32_t* codes;
+    int kt, nt;
+    int64_t sk, sn;   // tile strides
+    const uint32_t* xf;
+    const float* xs;
+    int rows, kb, splits;
+    float* ws;        // [splits][rows][N] partials
+    int* counters;    // [column blocks]
+    void* out;
+    int out_type;
+    int64_t out_stride;
+    const float* post;
+    int had;
+    uint32_t mult;
+};
+
+__device__ __forceinline__ void mma16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%0,%1,%2,%3};"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ int arrive(int* counter) {  // gpu-scope acquire-release add: the previous count
+    int prev;
+    asm volatile("atom.add.acq_rel.gpu.s32 %0, [%1], 1;" : "=r"(prev) : "l"(counter) : "memory");
+    return prev;
+}
+
+__device__ __forceinline__ void store_out(void* out, int type, int64_t idx, float v) {
+    if (type == TQ_F32) static_cast<float*>(out)[idx] = v;
+    else if (type == TQ_BF16) static_cast<__nv_bfloat16*>(out)[idx] = __float2bfloat16_rn(v);
+    else static_cast<__half*>(out)[idx] = __float2half_rn(v);
+}
+
+// rows x 128 sums in red (shared): per row (one warp each) 1/4, the optional output Hadamard, post; the stores
+__device__ __forceinline__ void finish(const Args& a, const float* red, int o0, int nv) {
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    constexpr float H128 = 0.08838834764831845f;  // 128^-1/2
+    float scale[4];
+#pragma unroll
+    for (int m = 0; m < 4; ++m) {
+        const int o = lane + 32 * m;
+        scale[m] = (a.had ? 0.25f * H128 : 0.25f) * (a.post != nullptr && o < nv ? __ldg(a.post + o0 + o) : 1.f);
+    }
+    for (int t = warp; t < a.rows; t += W4) {
+        float v[4];
+#pragma unroll
+        for (int m = 0; m < 4; ++m) v[m] = lane + 32 * m < nv ? red[t * 128 + lane + 32 * m] : 0.f;
+        if (a.had) tq::hadamard128(v, lane);
+#pragma unroll
+        for (int m = 0; m < 4; ++m)
+            if (lane + 32 * m < nv) store_out(a.out, a.out_type, t * a.out_stride + o0 + lane + 32 * m, v[m] * scale[m]);
+    }
+}
+
+// one CTA's work: column block cb (8 output tiles) over split `split` of the inputs
+template <int K, int RM, int D>
+__device__ __forceinline__ void gemv_body(const Args& a, int cb, int split) {
+    constexpr int WORDS = 8 * K, CODE_W = W4 * C4 * WORDS, STAGE = stage_words<K, RM>(), S = Occ<K, RM>::S;
+    extern __shared__ __align__(16) uint32_t sm[];
+    __shared__ int last;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, q = lane & 3;
+    const int R = (a.rows + 7) / 8;
+    const int i0 = split * a.kb, nk = min(a.kt - i0, a.kb), nch = nk / C4;
+    const int j0 = cb * W4, j = j0 + warp;
+    const bool active = j < a.nt;
+    // this thread's 16-byte copies per chunk: code units (each warp's 8 tiles are 2 WORDS units), activation units
+    // (128 per row group), scale units (4 per row group)
+    constexpr int UC = W4 * 2 * WORDS, NC = (UC + 32 * W4 - 1) / (32 * W4), NA = (RM * 128 + 32 * W4 - 1) / (32 * W4);
+    const uint32_t base = static_cast<uint32_t>(__cvta_generic_to_shared(sm));
+    const uint32_t* cnext[NC];
+    uint32_t cs[NC];
+    bool cok[NC];
+#pragma unroll
+    for (int i = 0; i < NC; ++i) {
+        const int u = threadIdx.x + 32 * W4 * i, w = u / (2 * WORDS), uu = u % (2 * WORDS);
+        const int d = 4 * uu / WORDS, word = 4 * uu % WORDS;
+        cok[i] = u < UC && j0 + w < a.nt;
+        cnext[i] = a.codes + ((int64_t)(i0 + d) * a.sk + (int64_t)(j0 + w) * a.sn) * WORDS + word;
+        cs[i] = base + 4 * (w * C4 * WORDS + 4 * uu);
+    }
+    const int64_t chunk_codes = (int64_t)C4 * a.sk * WORDS;
+    const uint32_t* anext = a.xf + (size_t)(i0 / C4) * R * (C4 * 64) + 4 * threadIdx.x;
+    const float* snext = a.xs + (size_t)(i0 / C4) * 16 * R + 4 * threadIdx.x;
+    const uint32_t as0 = base + 4 * (CODE_W + 4 * threadIdx.x), ss = base + 4 * (CODE_W + RM * C4 * 64 + 4 * threadIdx.x);
+    auto issue = [&](uint32_t off) {  // the next chunk into the stage at byte offset off
+#pragma unroll
+        for (int i = 0; i < NC; ++i) {
+            if (cok[i]) tq::cp16s(cs[i] + off, cnext[i]);
+            cnext[i] += chunk_codes;
+        }
+#pragma unroll
+        for (int i = 0; i < NA; ++i)
+            if (threadIdx.x + 32 * W4 * i < R * 128) tq::cp16s(as0 + off + 4 * 128 * W4 * i, anext + 128 * W4 * i);
+        if (threadIdx.x < 4 * R) tq::cp16s(ss + off, snext);
+        anext += R * (C4 * 64);
+        snext += 16 * R;
+    };
+#pragma unroll 1
+    for (int s = 0; s < S - 1; ++s) {
+        if (s < nch) issue(4 * STAGE * s);
+        tq::cp_commit();
+    }
+    const tq::Plan<K> plan(lane);
+    float acc[RM][4];
+#pragma unroll
+    for (int r = 0; r < RM; ++r)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) acc[r][e] = 0.f;
+#pragma unroll 1
+    for (int c = 0, cur = 0, next = S - 1; c < nch; ++c) {
+        tq::cp_wait<S - 2>();
+        __syncthreads();  // chunk c landed for every thread; chunk c - 1's stage is free
+        if (c + S - 1 < nch) issue(4 * STAGE * next);
+        tq::cp_commit();
+        const uint32_t* st = sm + cur * STAGE;
+        cur = cur + 1 == S ? 0 : cur + 1;
+        next = next + 1 == S ? 0 : next + 1;
+        if (active) {
+            float g[RM][4];
+#pragma unroll
+            for (int r = 0; r < RM; ++r)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) g[r][e] = 0.f;
+            const uint32_t* tw = st + warp * C4 * WORDS;
+            const uint2* xb = reinterpret_cast<const uint2*>(st + CODE_W) + lane;
+#pragma unroll
+            for (int d = 0; d < C4; ++d) {
+                uint32_t w[2 * tq::Plan<K>::ANCH], af[4];
+#pragma unroll
+                for (int x = 0; x < tq::Plan<K>::ANCH; ++x) {
+                    w[2 * x] = tw[d * WORDS + plan.lo[x]];
+                    w[2 * x + 1] = tw[d * WORDS + plan.hi[x]];
+                }
+                tq::decode_frag<K, D>(w, plan, a.mult, af);
+#pragma unroll
+                for (int r = 0; r < RM; ++r)
+                    if (r == 0 || r < R) {
+                        const uint2 bb = xb[(r * C4 + d) * 32];
+                        mma16816(g[r], af, bb.x, bb.y);
+                    }
+            }
+            // the chunk's scales 2^-e ([group][8]) then its sums ([group][8]): acc += (g - 1528 sum) 2^-e
+            const float* sc = reinterpret_cast<const float*>(st + CODE_W + RM * C4 * 64);
+#pragma unroll
+            for (int r = 0; r < RM; ++r)
+                if (r == 0 || r < R) {
+                    const float2 s2 = *reinterpret_cast<const float2*>(sc + 8 * r + 2 * q);
+                    const float2 x2 = *reinterpret_cast<const float2*>(sc + 8 * R + 8 * r + 2 * q);
+                    acc[r][0] = fmaf(fmaf(-1528.f, x2.x, g[r][0]), s2.x, acc[r][0]);
+                    acc[r][1] = fmaf(fmaf(-1528.f, x2.y, g[r][1]), s2.y, acc[r][1]);
+                    acc[r][2] = fmaf(fmaf(-1528.f, x2.x, g[r][2]), s2.x, acc[r][2]);
+                    acc[r][3] = fmaf(fmaf(-1528.f, x2.y, g[r][3]), s2.y, acc[r][3]);
+                }
+        }
+    }
+    tq::cp_wait<0>();
+    // d0, d1: output 16 j + g, tokens 2q, 2q + 1 of the group; d2, d3: output 16 j + g + 8
+    const int out_dim = a.nt * 16, o0 = cb * 128, nv = min(128, out_dim - o0);
+    float* red = reinterpret_cast<float*>(sm);  // rows x 128 sums (the stages are free once every warp is done)
+    const bool one = a.splits == 1;
+    if (one) __syncthreads();  // every warp has finished reading the stages
+    if (active) {
+        float* part = one ? red - o0 : a.ws + (size_t)split * a.rows * out_dim;
+        const int stride = one ? 128 : out_dim;
+        const int o = 16 * j + (lane >> 2);
+#pragma unroll
+        for (int r = 0; r < RM; ++r)
+            if (r < R) {
+                const int t0 = 8 * r + 2 * q;
+                if (t0 < a.rows) {
+                    part[(size_t)t0 * stride + o] = acc[r][0];
+                    part[(size_t)t0 * stride + o + 8] = acc[r][2];
+                }
+                if (t0 + 1 < a.rows) {
+                    part[(size_t)(t0 + 1) * stride + o] = acc[r][1];
+                    part[(size_t)(t0 + 1) * stride + o + 8] = acc[r][3];
+                }
+            }
+    }
+    if (!one) {
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0) last = arrive(a.counters + cb) == a.splits - 1;
+        __syncthreads();
+        if (!last) return;
+        // the splits' sums per (row, output) in split order into shared memory
+        const size_t step = (size_t)a.rows * out_dim;
+        const float* src = a.ws + o0;
+        for (int i = threadIdx.x; i < a.rows * 128; i += 32 * W4) {
+            const int t = i / 128, o = i % 128;
+            float sum = 0.f;
+            if (o < nv) {
+                const float* p = src + (size_t)t * out_dim + o;
+                int s = 0;
+                for (; s + 4 <= a.splits; s += 4) {
+                    const float v0 = __ldcg(p + s * step), v1 = __ldcg(p + (s + 1) * step);
+                    const float v2 = __ldcg(p + (s + 2) * step), v3 = __ldcg(p + (s + 3) * step);
+                    sum += v0, sum += v1, sum += v2, sum += v3;
+                }
+                for (; s < a.splits; ++s) sum += __ldcg(p + s * step);
+            }
+            red[i] = sum;
+        }
+    }
+    __syncthreads();
+    finish(a, red, o0, nv);
+    if (!one && threadIdx.x == 0) a.counters[cb] = 0;  // ready for the next call (and graph replays)
+}
+
+template <int K, int RM, int D>
+__global__ void __launch_bounds__(32 * W4, (Occ<K, RM>::CTAS)) gemv_k(Args a) {
+    gemv_body<K, RM, D>(a, blockIdx.x, blockIdx.y);
+}
+
+// ---- several matrices of one width in one launch (tq_gemv_group) ----------------------------------------------------
+constexpr int MAX_GROUP = 8;
+struct Multi {
+    int n;
+    int cb0[MAX_GROUP + 1];  // each member's first column block in the grid (cb0[n]: the grid's width)
+    Args a[MAX_GROUP];
+};
+
+// grid (sum of the members' column blocks, the most splits); a CTA past its member's splits has nothing to do.
+// __grid_constant__: the members' arguments are read in place from parameter space, whatever the member index.
+template <int K, int RM, int D>
+__global__ void __launch_bounds__(32 * W4, (Occ<K, RM>::CTAS)) gemv_multi_k(const __grid_constant__ Multi g) {
+    int m = 0;
+#pragma unroll
+    for (int i = 1; i < MAX_GROUP; ++i)
+        if (i < g.n && (int)blockIdx.x >= g.cb0[i]) m = i;
+    const Args& a = g.a[m];
+    if ((int)blockIdx.y >= a.splits) return;
+    gemv_body<K, RM, D>(a, blockIdx.x - g.cb0[m], blockIdx.y);
+}
+
+// ---- prepare: one warp per (row, 128-block) --------------------------------------------------------------------
+
+// one warp's (row t, 128-block c) of one matrix's activations from x's values xv (lane l, i: input 128 c + l + 32 i)
+__device__ __forceinline__ void prep_block(const float (&xv)[4], int t, int c, int groups, const float* __restrict__ pre,
+                                           int had, const __half* __restrict__ s16, __half* __restrict__ xf,
+                                           float* __restrict__ xs) {
+    const int lane = threadIdx.x % 32, k0 = 128 * c;
+    float v[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int k = lane + 32 * i;
+        v[i] = xv[i];
+        if (pre != nullptr) v[i] *= pre[k0 + k];
+    }
+    if (had) {
+        tq::hadamard128(v, lane);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) v[i] *= 0.08838834764831845f;
+    }
+    if (s16 != nullptr)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) v[i] *= __half2float(s16[(k0 + lane + 32 * i) / 16]);
+    const float m = tq::warp_max(fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3]))));
+    int x2 = 0;
+    frexpf(m > 0.f && m <= 3.0e38f ? m : 1.f, &x2);
+    const int e = 14 - x2;
+    __half* out = xf + ((size_t)(c * groups + t / 8) * 64 + t % 8) * 16;  // [c][group][k-tile][token][16]
+    float sum[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int k = lane + 32 * i;
+        const __half h = __float2half_rn(ldexpf(v[i], e));
+        out[(k / 16) * 128 + tq::frag_pos(k % 16)] = h;
+        sum[i] = __half2float(h);
+    }
+    float total = (sum[0] + sum[1]) + (sum[2] + sum[3]);
+#pragma unroll
+    for (int o = 1; o < 32; o *= 2) total += __shfl_xor_sync(0xffffffffu, total, o);
+    if (lane == 0) {
+        xs[(size_t)c * 16 * groups + t] = ldexpf(1.f, -e);
+        xs[(size_t)c * 16 * groups + 8 * groups + t] = total;
+    }
+}
+
+template <typename T>
+__global__ void __launch_bounds__(256) prepare_k(const T* __restrict__ x, int64_t x_stride, int rows, int K,
+                                                  const float* __restrict__ pre, int had,
+                                                  const __half* __restrict__ s16, __half* __restrict__ xf,
+                                                  float* __restrict__ xs) {
+    const int lane = threadIdx.x % 32, nb = K / 128, item = blockIdx.x * 8 + threadIdx.x / 32;
+    if (item >= rows * nb) return;
+    const int t = item / nb, c = item % nb;
+    const T* xr = x + (int64_t)t * x_stride + 128 * c;
+    float v[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) v[i] = tq::to_f32<T>(xr[lane + 32 * i]);
+    prep_block(v, t, c, (rows + 7) / 8, pre, had, s16, xf, xs);
+}
+
+// every member's activations from one read of x (tq_gemv_group)
+struct PrepMulti {
+    int n;
+    const float* pre[MAX_GROUP];
+    const __half* s16[MAX_GROUP];
+    __half* xf[MAX_GROUP];
+    float* xs[MAX_GROUP];
+    int had[MAX_GROUP];
+};
+
+template <typename T>
+__global__ void __launch_bounds__(256) prepare_multi_k(const T* __restrict__ x, int64_t x_stride, int rows, int K,
+                                                        const __grid_constant__ PrepMulti p) {
+    const int lane = threadIdx.x % 32, nb = K / 128, item = blockIdx.x * 8 + threadIdx.x / 32;
+    if (item >= rows * nb) return;
+    const int t = item / nb, c = item % nb;
+    const T* xr = x + (int64_t)t * x_stride + 128 * c;
+    float v[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) v[i] = tq::to_f32<T>(xr[lane + 32 * i]);
+    for (int m = 0; m < p.n; ++m) prep_block(v, t, c, (rows + 7) / 8, p.pre[m], p.had[m], p.s16[m], p.xf[m], p.xs[m]);
+}
+
+// ---- host side -----------------------------------------------------------------------------------------------------
+
+size_t align256(size_t b) { return (b + 255) / 256 * 256; }
+
+int max_splits(int rows) {
+    const int groups = (rows + 7) / 8;
+    return 16 / groups > 2 ? 16 / groups : 2;
+}
+
+// split length in k-tiles (a multiple of 8): at most 128; shorter while the grid has fewer than two CTAs per SM, but
+// at most max_splits(rows) splits (the engine's rule, docs/consumer-engine.md section 12)
+int split_kb(int kt, int nt, int rows) {
+    const int cbs = (nt + W4 - 1) / W4, target = 2 * tq::device_sms();
+    int kb = kt < 128 ? kt : 128;
+    while (kb > C4) {
+        const int next = kb - C4, splits = (kt + next - 1) / next;
+        if (cbs * ((kt + kb - 1) / kb) >= target || splits > max_splits(rows)) break;
+        kb = next;
+    }
+    return kb;
+}
+
+struct Layout {
+    size_t counters, xf, xs, part, total;
+};
+
+Layout layout(int K, int N, int rows) {
+    const int kt = K / 16, groups = (rows + 7) / 8, cbs = (N / 16 + W4 - 1) / W4;
+    const int bound = (kt + 127) / 128 > max_splits(rows) ? (kt + 127) / 128 : max_splits(rows);  // splits <= this
+    (void)cbs;
+    Layout l;
+    l.counters = 0;  // a fixed region, whatever the shape: a workspace reused across shapes keeps its zeroed counters
+    l.xf = TQ_GEMV_COUNTER_BYTES;
+    l.xs = l.xf + align256((size_t)(K / 128) * groups * 2048);
+    l.part = l.xs + align256((size_t)(K / 128) * 16 * groups * sizeof(float));
+    l.total = l.part + align256((size_t)bound * rows * N * sizeof(float));
+    return l;
+}
+
+template <int K, int RM, int D>
+cudaError_t launch_v(const Args& a, int cbs, cudaStream_t s) {
+    using O = Occ<K, RM>;
+    static int configured[64] = {0};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev >= 0 && dev < 64 && !configured[dev]) {
+        cudaError_t e = cudaFuncSetAttribute(gemv_k<K, RM, D>, cudaFuncAttributeMaxDynamicSharedMemorySize, O::SMEM);
+        if (e == cudaSuccess)
+            e = cudaFuncSetAttribute(gemv_k<K, RM, D>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+        if (e != cudaSuccess) return e;
+        configured[dev] = 1;
+    }
+    gemv_k<K, RM, D><<<dim3(cbs, a.splits), dim3(32 * W4), O::SMEM, s>>>(a);
+    return cudaGetLastError();
+}
+
+template <int K, int RM>
+cudaError_t launch_rm(const Args& a, int cbs, bool v4, cudaStream_t s) {
+    // version 6's decode, except at 2 bits and 64 rows, where version 4's measured 0.5-1.3% faster in the engine (its
+    // default_variant); TQ_DECODE_V4: version 4's at 2 bits (A/B timing)
+    if constexpr (K == 2 && RM == 8) return launch_v<K, RM, 0>(a, cbs, s);
+    else if constexpr (K == 2) return v4 ? launch_v<K, RM, 0>(a, cbs, s) : launch_v<K, RM, 1>(a, cbs, s);
+    else return (void)v4, launch_v<K, RM, 1>(a, cbs, s);
+}
+
+template <int K>
+cudaError_t launch_k(const Args& a, int cbs, bool v4, cudaStream_t s) {
+    const int groups = (a.rows + 7) / 8;
+    if (groups <= 1) return launch_rm<K, 1>(a, cbs, v4, s);
+    if (groups <= 2) return launch_rm<K, 2>(a, cbs, v4, s);
+    if (groups <= 4) return launch_rm<K, 4>(a, cbs, v4, s);
+    return launch_rm<K, 8>(a, cbs, v4, s);
+}
+
+template <int K, int RM, int D>
+cudaError_t launch_multi_v(const Multi& g, int splits, cudaStream_t s) {
+    using O = Occ<K, RM>;
+    static int configured[64] = {0};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev >= 0 && dev < 64 && !configured[dev]) {
+        cudaError_t e =
+            cudaFuncSetAttribute(gemv_multi_k<K, RM, D>, cudaFuncAttributeMaxDynamicSharedMemorySize, O::SMEM);
+        if (e == cudaSuccess)
+            e = cudaFuncSetAttribute(gemv_multi_k<K, RM, D>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+        if (e != cudaSuccess) return e;
+        configured[dev] = 1;
+    }
+    gemv_multi_k<K, RM, D><<<dim3(g.cb0[g.n], splits), dim3(32 * W4), O::SMEM, s>>>(g);
+    return cudaGetLastError();
+}
+
+template <int K, int RM>
+cudaError_t launch_multi_rm(const Multi& g, int splits, bool v4, cudaStream_t s) {  // the variants of launch_rm
+    if constexpr (K == 2 && RM == 8) return launch_multi_v<K, RM, 0>(g, splits, s);
+    else if constexpr (K == 2) return v4 ? launch_multi_v<K, RM, 0>(g, splits, s) : launch_multi_v<K, RM, 1>(g, splits, s);
+    else return (void)v4, launch_multi_v<K, RM, 1>(g, splits, s);
+}
+
+template <int K>
+cudaError_t launch_multi_k(const Multi& g, int rows, int splits, bool v4, cudaStream_t s) {
+    const int groups = (rows + 7) / 8;
+    if (groups <= 1) return launch_multi_rm<K, 1>(g, splits, v4, s);
+    if (groups <= 2) return launch_multi_rm<K, 2>(g, splits, v4, s);
+    if (groups <= 4) return launch_multi_rm<K, 4>(g, splits, v4, s);
+    return launch_multi_rm<K, 8>(g, splits, v4, s);
+}
+
+// a group's workspace: the counters, then each member's activations, scales and partials (tq_gemv's layout)
+size_t group_layout(int n, const tq_matrix* ms, int rows, size_t* xf, size_t* xs, size_t* part) {
+    size_t off = TQ_GEMV_COUNTER_BYTES;
+    for (int i = 0; i < n; ++i) {
+        const Layout l = layout(ms[i].K, ms[i].N, rows);
+        xf[i] = off, off += l.xs - l.xf;
+        xs[i] = off, off += l.part - l.xs;
+        part[i] = off, off += l.total - l.part;
+    }
+    return off;
+}
+
+}  // namespace
+
+namespace tq {
+// prepare the activations of a GEMV into the workspace (also used by tests)
+cudaError_t prepare(const void* x, tq_dtype xt, int64_t x_stride, int rows, int K, const float* pre, int had,
+                    const void* s16, void* xf, void* xs, cudaStream_t s) {
+    const unsigned blocks = (unsigned)((rows * (K / 128) + 7) / 8);
+    const __half* sc = static_cast<const __half*>(s16);
+    __half* f = static_cast<__half*>(xf);
+    float* sx = static_cast<float*>(xs);
+    switch (xt) {
+        case TQ_F32:
+            prepare_k<float><<<blocks, 256, 0, s>>>(static_cast<const float*>(x), x_stride, rows, K, pre, had, sc, f, sx);
+            break;
+        case TQ_BF16:
+            prepare_k<__nv_bfloat16><<<blocks, 256, 0, s>>>(static_cast<const __nv_bfloat16*>(x), x_stride, rows, K,
+                                                            pre, had, sc, f, sx);
+            break;
+        default:
+            prepare_k<__half><<<blocks, 256, 0, s>>>(static_cast<const __half*>(x), x_stride, rows, K, pre, had, sc, f,
+                                                     sx);
+    }
+    return cudaGetLastError();
+}
+}  // namespace tq
+
+extern "C" {
+size_t tq_gemv_workspace_bytes(int K, int N, int rows) {
+    if (K <= 0 || N <= 0 || K % 128 || N % 16 || rows < 1 || rows > MAX_ROWS) return 0;
+    return layout(K, N, rows).total;
+}
+
+int tq_gemv(const tq_matrix* m, const void* x, tq_dtype x_type, int64_t x_stride, int rows, void* out,
+            tq_dtype out_type, int64_t out_stride, const float* pre, const float* post, int flags, void* ws,
+            size_t ws_bytes, void* stream) {
+    if (int e = tq::check_matrix(m, 128, "tq_gemv")) return e;
+    if (rows < 1 || rows > MAX_ROWS || x == nullptr || out == nullptr || x_stride < m->K || out_stride < m->N ||
+        x_type < TQ_F32 || x_type > TQ_F16 || out_type < TQ_F32 || out_type > TQ_F16)
+        return tq::fail(TQ_E_ARG, "tq_gemv: 1-64 rows, x and out with strides >= K and N");
+    if ((flags & TQ_HAD128_OUT) && m->N % 128) return tq::fail(TQ_E_ARG, "tq_gemv: TQ_HAD128_OUT needs N % 128 == 0");
+    if (tq::device_cc() < 80) return tq::fail(TQ_E_ARCH, "tq_gemv: needs sm_80 or newer (mma.sync m16n8k16)");
+    if ((m->N / 16 + W4 - 1) / W4 > TQ_GEMV_COUNTER_BYTES / (int)sizeof(int))
+        return tq::fail(TQ_E_ARG, "tq_gemv: N above the counters' capacity (2,097,152 outputs)");
+    const Layout l = layout(m->K, m->N, rows);
+    if (ws == nullptr || ws_bytes < l.total || reinterpret_cast<uintptr_t>(ws) % 256)
+        return tq::fail(TQ_E_WORKSPACE, "tq_gemv: workspace smaller than tq_gemv_workspace_bytes (or not 256-aligned)");
+    cudaStream_t s = static_cast<cudaStream_t>(stream);
+    char* w = static_cast<char*>(ws);
+    if (cudaError_t e = tq::prepare(x, x_type, x_stride, rows, m->K, pre, (flags & TQ_HAD128_IN) ? 1 : 0,
+                                     m->block_scale, w + l.xf, w + l.xs, s))
+        return tq::check(e, "tq_gemv prepare launch");
+    const int kt = m->K / 16, nt = m->N / 16, kb = split_kb(kt, nt, rows);
+    Args a;
+    a.codes = static_cast<const uint32_t*>(m->codes);
+    a.kt = kt, a.nt = nt, a.sk = m->tile_stride_k, a.sn = m->tile_stride_n;
+    a.xf = reinterpret_cast<const uint32_t*>(w + l.xf);
+    a.xs = reinterpret_cast<const float*>(w + l.xs);
+    a.rows = rows, a.kb = kb, a.splits = (kt + kb - 1) / kb;
+    a.ws = reinterpret_cast<float*>(w + l.part);
+    a.counters = reinterpret_cast<int*>(w + l.counters);
+    a.out = out, a.out_type = out_type, a.out_stride = out_stride;
+    a.post = post, a.had = (flags & TQ_HAD128_OUT) ? 1 : 0, a.mult = m->mult;
+    const int cbs = (nt + W4 - 1) / W4;
+    const bool v4 = (flags & TQ_DECODE_V4) != 0;
+    cudaError_t e;
+    switch (m->bits) {
+        case 1: e = launch_k<1>(a, cbs, v4, s); break;
+        case 2: e = launch_k<2>(a, cbs, v4, s); break;
+        case 3: e = launch_k<3>(a, cbs, v4, s); break;
+        case 4: e = launch_k<4>(a, cbs, v4, s); break;
+        case 5: e = launch_k<5>(a, cbs, v4, s); break;
+        default: e = launch_k<6>(a, cbs, v4, s); break;
+    }
+    return tq::check(e, "tq_gemv launch");
+}
+
+size_t tq_gemv_group_workspace_bytes(int n, const tq_matrix* ms, int rows) {
+    if (n < 1 || n > MAX_GROUP || ms == nullptr || rows < 1 || rows > MAX_ROWS) return 0;
+    for (int i = 0; i < n; ++i)
+        if (ms[i].K <= 0 || ms[i].N <= 0 || ms[i].K % 128 || ms[i].N % 16 || ms[i].K != ms[0].K) return 0;
+    size_t xf[MAX_GROUP], xs[MAX_GROUP], part[MAX_GROUP];
+    return group_layout(n, ms, rows, xf, xs, part);
+}
+
+int tq_gemv_group(int n, const tq_matrix* ms, const void* x, tq_dtype x_type, int64_t x_stride, int rows,
+                  void* const* outs, tq_dtype out_type, const int64_t* out_strides, const float* const* pre,
+                  const float* const* post, const int* flags, void* ws, size_t ws_bytes, void* stream) {
+    if (n < 1 || n > MAX_GROUP || ms == nullptr || outs == nullptr)
+        return tq::fail(TQ_E_ARG, "tq_gemv_group: 1-8 matrices, and an output for each");
+    int total_cbs = 0;
+    for (int i = 0; i < n; ++i) {
+        if (int e = tq::check_matrix(&ms[i], 128, "tq_gemv_group")) return e;
+        const int64_t os = out_strides != nullptr ? out_strides[i] : ms[i].N;
+        if (ms[i].K != ms[0].K || outs[i] == nullptr || os < ms[i].N)
+            return tq::fail(TQ_E_ARG, "tq_gemv_group: one K for every matrix, outputs with strides >= N");
+        if (flags != nullptr && (flags[i] & TQ_HAD128_OUT) && ms[i].N % 128)
+            return tq::fail(TQ_E_ARG, "tq_gemv_group: TQ_HAD128_OUT needs N % 128 == 0");
+        total_cbs += (ms[i].N / 16 + W4 - 1) / W4;
+    }
+    const int K = ms[0].K;
+    if (rows < 1 || rows > MAX_ROWS || x == nullptr || x_stride < K || x_type < TQ_F32 || x_type > TQ_F16 ||
+        out_type < TQ_F32 || out_type > TQ_F16)
+        return tq::fail(TQ_E_ARG, "tq_gemv_group: 1-64 rows, x with stride >= K");
+    if (tq::device_cc() < 80) return tq::fail(TQ_E_ARCH, "tq_gemv_group: needs sm_80 or newer (mma.sync m16n8k16)");
+    if (total_cbs > TQ_GEMV_COUNTER_BYTES / (int)sizeof(int))
+        return tq::fail(TQ_E_ARG, "tq_gemv_group: outputs above the counters' capacity (2,097,152 in all)");
+    size_t xf[MAX_GROUP], xs[MAX_GROUP], part[MAX_GROUP];
+    const size_t need = group_layout(n, ms, rows, xf, xs, part);
+    if (ws == nullptr || ws_bytes < need || reinterpret_cast<uintptr_t>(ws) % 256)
+        return tq::fail(TQ_E_WORKSPACE,
+                        "tq_gemv_group: workspace smaller than tq_gemv_group_workspace_bytes (or not 256-aligned)");
+    cudaStream_t s = static_cast<cudaStream_t>(stream);
+    char* w = static_cast<char*>(ws);
+    PrepMulti p{};
+    p.n = n;
+    for (int i = 0; i < n; ++i) {
+        p.pre[i] = pre != nullptr ? pre[i] : nullptr;
+        p.s16[i] = static_cast<const __half*>(ms[i].block_scale);
+        p.xf[i] = reinterpret_cast<__half*>(w + xf[i]);
+        p.xs[i] = reinterpret_cast<float*>(w + xs[i]);
+        p.had[i] = flags != nullptr && (flags[i] & TQ_HAD128_IN) ? 1 : 0;
+    }
+    const unsigned blocks = (unsigned)((rows * (K / 128) + 7) / 8);
+    switch (x_type) {
+        case TQ_F32:
+            prepare_multi_k<float><<<blocks, 256, 0, s>>>(static_cast<const float*>(x), x_stride, rows, K, p);
+            break;
+        case TQ_BF16:
+            prepare_multi_k<__nv_bfloat16>
+                <<<blocks, 256, 0, s>>>(static_cast<const __nv_bfloat16*>(x), x_stride, rows, K, p);
+            break;
+        default:
+            prepare_multi_k<__half><<<blocks, 256, 0, s>>>(static_cast<const __half*>(x), x_stride, rows, K, p);
+    }
+    if (cudaError_t e = cudaGetLastError()) return tq::check(e, "tq_gemv_group prepare launch");
+    // one GEMV launch per (width, decode variant), the members in their order; counters at each member's offset
+    Args a[MAX_GROUP];
+    int gcb[MAX_GROUP];
+    for (int i = 0, cum = 0; i < n; ++i) {
+        const tq_matrix* m = &ms[i];
+        const int kt = K / 16, nt = m->N / 16, kb = split_kb(kt, nt, rows);
+        Args& ai = a[i];
+        ai.codes = static_cast<const uint32_t*>(m->codes);
+        ai.kt = kt, ai.nt = nt, ai.sk = m->tile_stride_k, ai.sn = m->tile_stride_n;
+        ai.xf = reinterpret_cast<const uint32_t*>(w + xf[i]);
+        ai.xs = reinterpret_cast<const float*>(w + xs[i]);
+        ai.rows = rows, ai.kb = kb, ai.splits = (kt + kb - 1) / kb;
+        ai.ws = reinterpret_cast<float*>(w + part[i]);
+        ai.counters = reinterpret_cast<int*>(w) + cum;
+        ai.out = outs[i], ai.out_type = out_type, ai.out_stride = out_strides != nullptr ? out_strides[i] : m->N;
+        ai.post = post != nullptr ? post[i] : nullptr;
+        ai.had = flags != nullptr && (flags[i] & TQ_HAD128_OUT) ? 1 : 0, ai.mult = m->mult;
+        gcb[i] = (nt + W4 - 1) / W4;
+        cum += gcb[i];
+    }
+    bool done[MAX_GROUP] = {false};
+    for (int i = 0; i < n; ++i) {
+        if (done[i]) continue;
+        const bool v4 = flags != nullptr && (flags[i] & TQ_DECODE_V4);
+        Multi g{};
+        int splits = 0;
+        for (int j = i; j < n; ++j) {
+            const bool v4j = flags != nullptr && (flags[j] & TQ_DECODE_V4);
+            if (done[j] || ms[j].bits != ms[i].bits || (ms[i].bits == 2 && v4j != v4)) continue;
+            done[j] = true;
+            g.a[g.n++] = a[j];
+        }
+        // the column-block offsets of this launch's members
+        for (int k = 0, at = 0; k < g.n; ++k) {
+            g.cb0[k] = at;
+            at += (g.a[k].nt + W4 - 1) / W4;
+            g.cb0[k + 1] = at;
+            splits = g.a[k].splits > splits ? g.a[k].splits : splits;
+        }
+        cudaError_t e;
+        switch (ms[i].bits) {
+            case 1: e = launch_multi_k<1>(g, rows, splits, v4, s); break;
+            case 2: e = launch_multi_k<2>(g, rows, splits, v4, s); break;
+            case 3: e = launch_multi_k<3>(g, rows, splits, v4, s); break;
+            case 4: e = launch_multi_k<4>(g, rows, splits, v4, s); break;
+            case 5: e = launch_multi_k<5>(g, rows, splits, v4, s); break;
+            default: e = launch_multi_k<6>(g, rows, splits, v4, s); break;
+        }
+        if (e != cudaSuccess) return tq::check(e, "tq_gemv_group launch");
+    }
+    return 0;
+}
+}

@@ -7042,6 +7042,13 @@ class GGMLQuantizationType(IntEnum):
     Q1_0    = 41
     Q2_0    = 42
     F8_E4M3 = 43
+    # trellis fork: trellis-coded weights at 1-6 bits (docs/llamacpp.md in the quantization repository)
+    TRL1 = 44
+    TRL2 = 45
+    TRL3 = 46
+    TRL4 = 47
+    TRL5 = 48
+    TRL6 = 49
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -7282,6 +7289,12 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
     GGMLQuantizationType.F8_E4M3: (1, 1),
+    GGMLQuantizationType.TRL1: (16, 2),
+    GGMLQuantizationType.TRL2: (16, 4),
+    GGMLQuantizationType.TRL3: (16, 6),
+    GGMLQuantizationType.TRL4: (16, 8),
+    GGMLQuantizationType.TRL5: (16, 10),
+    GGMLQuantizationType.TRL6: (16, 12),
 }
 
 

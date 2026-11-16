@@ -2513,9 +2513,103 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
         // blocks that are not model layers (e.g. the blocks of a head) go with the output
         buft_list_layer = (size_t) tn.bid < pimpl->dev_layer.size() ? pimpl->dev_layer.at(tn.bid).buft_list : pimpl->dev_output.buft_list;
     }
-    return ml.create_tensor(
+    ggml_tensor * t = ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
+    if (t != nullptr && ggml_is_trellis_type(t->type) && !(flags & TENSOR_DUPLICATED)) {
+        create_trellis_sides(ml, tn, t);
+    }
+    return t;
+}
+
+// trellis fork: the side tensors are named after the weight, its suffix's trailing "weight" replaced by trellis_<side>
+// (blk.0.attn_qkv.weight -> blk.0.attn_qkv.trellis_pre), and created with the weight's tensor info, so they land on its
+// device and buffer type
+void llama_model_base::create_trellis_sides(llama_model_loader & ml, const LLM_TN_IMPL & tn, ggml_tensor * w) {
+    const int version_key = gguf_find_key(ml.metadata, "trellis.version");
+    if (version_key < 0 || gguf_get_kv_type(ml.metadata, version_key) != GGUF_TYPE_UINT32 ||
+        gguf_get_val_u32(ml.metadata, version_key) != 1) {
+        throw std::runtime_error("NariQ: coded tensors require trellis.version = 1");
+    }
+    std::string base = tn.suffix != nullptr ? tn.suffix : "";
+    if (base == "weight") {
+        base.clear();
+    } else if (base.size() > 7 && base.compare(base.size() - 7, 7, ".weight") == 0) {
+        base.resize(base.size() - 7);
+    } else {
+        throw std::runtime_error(format("trellis: coded tensor %s does not end in weight", tn.str().c_str()));
+    }
+    auto side = [&](const char * what, const std::initializer_list<int64_t> & ne, int flags) {
+        const std::string suffix = base.empty() ? std::string(what) : base + "." + what;
+        const LLM_TN_IMPL stn(tn.arch, tn.tensor, suffix.c_str(), tn.bid, tn.xid);
+        return create_tensor(ml, stn, ne, flags);
+    };
+    const int64_t K = w->ne[0], N = w->ne[1];
+    llama_trellis_weight tw;
+    tw.s16  = side("trellis_s16",  {K / 16}, 0);
+    tw.pre  = side("trellis_pre",  {K},      0);
+    tw.post = side("trellis_post", {N},      0);
+    tw.pin  = side("trellis_pin",  {K},      TENSOR_NOT_REQUIRED);
+    tw.pout = side("trellis_pout", {N},      TENSOR_NOT_REQUIRED);
+    const std::string name = tn.str();
+    const std::string key = "trellis.desc." + name.substr(0, name.size() - 7);
+    ml.get_arr(key, tw.desc, true);
+    if (!ggml_trellis_desc_supported(K, N, tw.desc.data(), (int) tw.desc.size())) {
+        throw std::runtime_error(format("trellis: %s is not a valid side description", key.c_str()));
+    }
+    trellis.weights[w] = std::move(tw);
+}
+
+bool llama_model_base::create_trellis_bands(int64_t n_embd, int64_t n_vocab) {
+    uint32_t n_bands = 0;
+    if (!ml->get_key("trellis.lm_head_bands", n_bands, false) || n_bands == 0) {
+        return false;
+    }
+    int64_t rows = 0;
+    for (uint32_t b = 0; b < n_bands; ++b) {
+        const std::string suffix = format("band%02u.weight", b);
+        const LLM_TN_IMPL btn = tn(LLM_TENSOR_OUTPUT, suffix.c_str());
+        const ggml_tensor * meta = ml->get_tensor_meta(btn.str().c_str());
+        if (meta == nullptr) {
+            throw std::runtime_error(format("trellis: lm_head band %s missing", btn.str().c_str()));
+        }
+        trellis.bands.push_back(create_tensor(btn, {n_embd, meta->ne[1]}, 0));
+        rows += meta->ne[1];
+    }
+    if (rows != n_vocab) {
+        throw std::runtime_error(format("trellis: the lm_head bands hold %lld rows, the vocabulary %lld", (long long) rows, (long long) n_vocab));
+    }
+    trellis.vocab_gather = create_tensor(tn(LLM_TENSOR_OUTPUT, "vocab_gather"), {n_vocab}, 0);
+    LLAMA_LOG_INFO("%s: trellis lm_head in %u coded bands\n", __func__, n_bands);
+    return true;
+}
+
+bool llama_model_base::create_trellis_embed_bands(int64_t n_embd, int64_t n_vocab) {
+    uint32_t n_bands = 0;
+    if (!ml->get_key("trellis.embed_bands", n_bands, false) || n_bands == 0) {
+        return false;
+    }
+    int64_t rows = 0;
+    for (uint32_t b = 0; b < n_bands; ++b) {
+        const std::string suffix = format("band%02u.weight", b);
+        const LLM_TN_IMPL btn = tn(LLM_TENSOR_TOKEN_EMBD, suffix.c_str());
+        const ggml_tensor * meta = ml->get_tensor_meta(btn.str().c_str());
+        if (meta == nullptr) {
+            throw std::runtime_error(format("trellis: embedding band %s missing", btn.str().c_str()));
+        }
+        ggml_tensor * w = create_tensor(btn, {n_embd, meta->ne[1]}, 0);
+        if (trellis_weight(w) == nullptr) {
+            throw std::runtime_error(format("trellis: embedding band %s is not coded", btn.str().c_str()));
+        }
+        trellis.embed_bands.push_back(w);
+        rows += meta->ne[1];
+    }
+    if (rows != n_vocab) {
+        throw std::runtime_error(format("trellis: the embedding bands hold %lld rows, the vocabulary %lld", (long long) rows, (long long) n_vocab));
+    }
+    trellis.embed_gather = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "vocab_gather"), {n_vocab}, 0);
+    LLAMA_LOG_INFO("%s: trellis embedding in %u coded bands\n", __func__, n_bands);
+    return true;
 }
 
 std::string llama_model::arch_name() const {

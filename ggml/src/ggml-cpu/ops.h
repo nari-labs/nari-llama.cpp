@@ -53,6 +53,9 @@ void ggml_compute_forward_set(const struct ggml_compute_params * params, struct 
 void ggml_compute_forward_cpy(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_cont(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_get_rows(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_trellis_get_rows(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_trellis(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+size_t ggml_compute_forward_trellis_work_size(const struct ggml_tensor * dst, int n_tasks);
 void ggml_compute_forward_get_rows_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_set_rows(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_diag(const struct ggml_compute_params * params, struct ggml_tensor * dst);

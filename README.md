@@ -1,3 +1,19 @@
+# nari-llama.cpp
+
+NariQ support for Qwen3.8-27B: trellis-coded weights with CPU and NVIDIA CUDA execution.
+
+This is a development fork. No NariQ release is published yet. Build and run the checked-out source using the [NariQ guide](nariq/README.md). The [release-readiness checklist](nariq/release-readiness.md) distinguishes implemented support from platform tests still required.
+
+- Includes the NariQ converter, TRL1-TRL6 tensors, model loader, and vendored libtrellis.
+- Linux build, Docker packaging and Windows artifact recipes live in `nariq/` and `.github/workflows/`.
+- Apple Silicon CPU builds are experimental. NariQ Metal, Vulkan and HIP GPU kernels are not implemented.
+- LoRA adapters on NariQ weights are not supported and are rejected explicitly.
+- CI uploads build artifacts only; it does not publish releases or container images.
+
+Upstream llama.cpp documentation follows. Its platform/backend claims do not imply support for the custom NariQ tensor types.
+
+---
+
 # llama.cpp
 
 ![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)

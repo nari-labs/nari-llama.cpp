@@ -1,5 +1,16 @@
 find_package(Threads REQUIRED)
 
+if (GGML_CPU)
+    add_executable(test-trellis test-trellis.cpp)
+    target_compile_features(test-trellis PRIVATE cxx_std_17)
+    target_link_libraries(test-trellis PRIVATE ggml)
+    add_test(NAME test-trellis COMMAND test-trellis)
+    add_executable(test-trellis-metadata test-trellis-metadata.cpp)
+    target_compile_features(test-trellis-metadata PRIVATE cxx_std_17)
+    target_link_libraries(test-trellis-metadata PRIVATE llama ggml)
+    add_test(NAME test-trellis-metadata COMMAND test-trellis-metadata)
+endif()
+
 llama_add_compile_flags()
 
 # Optional args:

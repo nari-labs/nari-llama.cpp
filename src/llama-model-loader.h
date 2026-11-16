@@ -77,6 +77,7 @@ struct llama_model_loader {
     size_t   n_bytes    = 0;
 
     bool use_mmap = false;
+    bool trellis_gpu_warned = false; // trellis fork: the coded linears fell back to the CPU (below sm_80)
     bool use_direct_io = false;
     bool check_tensors;
     bool no_alloc;

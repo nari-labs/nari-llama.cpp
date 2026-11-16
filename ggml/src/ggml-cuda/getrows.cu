@@ -101,6 +101,22 @@ static __global__ void k_get_rows_float(
     }
 }
 
+// rows of a few elements, one index dimension (a gather along the columns of a transposed vector): one thread per
+// element, not one block per row
+template<typename src0_t, typename dst_t>
+static __global__ void k_get_rows_float_narrow(
+        const src0_t * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
+        const int64_t ne00, const int64_t ne10, const size_t nb01, const size_t s1, const size_t s10) {
+    const int64_t i = blockIdx.x*(int64_t) blockDim.x + threadIdx.x;
+    if (i >= ne10*ne00) {
+        return;
+    }
+    const int64_t i10 = i / ne00;
+    const int64_t i00 = i - i10*ne00;
+    const int i01 = src1[i10*s10];
+    dst[i10*s1 + i00] = ggml_cuda_cast<dst_t>(((const src0_t *) ((const char *) src0 + i01*nb01))[i00]);
+}
+
 template<typename dst_t>
 static __global__ void k_get_rows_float_vec(
         const dst_t * src0_ptr, const int32_t * src1_ptr, dst_t * dst_ptr,
@@ -253,6 +269,14 @@ static void get_rows_cuda_float(
     GGML_ASSERT(ne12 > 0);
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
+
+    if (ne00 < 32 && ne11 == 1 && ne12 == 1) {
+        const int64_t n = ne10*ne00;
+        const int threads = 256;
+        k_get_rows_float_narrow<<<(unsigned) ((n + threads - 1) / threads), threads, 0, stream>>>(
+            src0_d, src1_d, dst_d, ne00, ne10, nb01, s1, s10);
+        return;
+    }
 
     if constexpr (std::is_same<src0_t, dst_t>::value) {
         constexpr int VEC = 16 / sizeof(dst_t);
