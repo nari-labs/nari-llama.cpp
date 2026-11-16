@@ -6,7 +6,8 @@ Ollama and LM Studio cannot load those files.
 - Create a destination folder, then extract this archive and the matching `cudart-nari-llama.cpp-...` archive with `tar -xzf ARCHIVE --strip-components=1 -C DESTINATION`. This places the programs and runtime libraries together.
 - Needs:
   - an NVIDIA driver of 570 or newer;
-  - glibc 2.34 or newer (Ubuntu 22.04, Debian 12, RHEL 9 or newer);
+  - glibc 2.34 or newer;
+  - libstdc++ providing `GLIBCXX_3.4.30` (updated Ubuntu 22.04 or Debian 12 meet these runtime requirements);
   - libgomp.
 - GPUs: real code for RTX 30xx, RTX 40xx / L4 and RTX 50xx / RTX PRO 6000. Any other card of compute capability 8.0
   or newer (A100, H100) compiles PTX on the first run.

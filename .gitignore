@@ -156,4 +156,5 @@ AGENTS.local.md
 
 # NariQ local artifacts
 /nariq-dist/
+/nariq-dist-*/
 /nariq-build/

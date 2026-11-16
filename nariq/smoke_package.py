@@ -43,7 +43,11 @@ with tempfile.TemporaryDirectory() as tmp:
     env = {**os.environ, "CUDA_VISIBLE_DEVICES": "", "LD_LIBRARY_PATH": os.pathsep.join([str(binary.parent), *runtime_dirs])}
     subprocess.run([str(binary), "--version"], env=env, check=True, timeout=60)
     cli = binary.parent / ("llama-cli.exe" if windows else "llama-cli")
-    subprocess.run([str(cli), "--list-devices"], env=env, check=True, timeout=60)
+    devices = subprocess.run([str(cli), "--verbose", "--list-devices"], env=env, check=True,
+                             timeout=60, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    print(devices.stdout, end="")
+    if "loaded CPU backend" not in devices.stdout:
+        raise SystemExit("Packaged CPU backend could not be loaded")
     if not list(binary.parent.glob("*ggml-cpu*")):
         raise SystemExit("Package contains no CPU backend")
 print("Archive checksums, extraction, provenance, UI and CPU startup checks passed")
