@@ -1,5 +1,6 @@
 #include "llama.h"
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "gguf.h"
 
 #include <cstdio>
@@ -20,6 +21,7 @@ static void check(bool ok, const char * message) {
 }
 
 int main() {
+    ggml_backend_load_all();
     llama_log_set(log_message, nullptr);
     for (int version : {-1, 0, 1, 2, 3}) {
         auto * ctx = ggml_init({1024 * 1024, nullptr, false});
