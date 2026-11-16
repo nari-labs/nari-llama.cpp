@@ -56,10 +56,21 @@ jobs:
       - name: Ninja
         run: choco install ninja -y
 
+      - name: Pin LLVM to the bundled OpenMP runtime
+        shell: pwsh
+        run: |
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-20.1.8/LLVM-20.1.8-win64.exe"
+          curl.exe -fsSL --retry 3 -o LLVM.exe $url
+          if ($LASTEXITCODE -ne 0) { throw "LLVM download failed" }
+          if ((Get-FileHash LLVM.exe -Algorithm SHA256).Hash.ToLower() -ne "3197846a2b19063687dd56e93e34cd941e3548d907f23a6131571321bdf9fe7b") { throw "LLVM checksum mismatch" }
+          $process = Start-Process -Wait -PassThru -FilePath .\LLVM.exe -ArgumentList '/S', '/D=C:\nariq-llvm'
+          if ($process.ExitCode -ne 0) { throw "LLVM installation failed" }
+
       - name: Programs and CPU backends (clang, every x86-64 CPU variant)
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          set "PATH=C:\nariq-llvm\bin;%PATH%"
           cmake -S . -B build-cpu -G "Ninja Multi-Config" -DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
             -DLLAMA_BUILD_BORINGSSL=ON -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON ^
             -DGGML_OPENMP=ON -DGGML_OPENMP_FETCH=ON -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=OFF ^
@@ -92,7 +103,7 @@ jobs:
           Copy-Item nariq\LICENSE "$name\LICENSE-NariQ"
           Copy-Item nariq\NOTICE "$name\NOTICE-NariQ"
           Copy-Item ggml\src\ggml-cuda\libtrellis\LICENSE "$name\LICENSE-libtrellis"
-          python nariq/provenance.py . | Out-File -Encoding utf8 "$name\build-info.json"
+          python nariq/provenance.py . build-cpu build-cuda | Out-File -Encoding utf8 "$name\build-info.json"
           if ($LASTEXITCODE -ne 0) { throw "provenance failed" }
           Copy-Item nariq\README-release.md "$name\README.md"
           Copy-Item "$env:CUDA_DIR\bin\cudart64_*.dll", "$env:CUDA_DIR\bin\cublas64_*.dll", "$env:CUDA_DIR\bin\cublasLt64_*.dll" $cudart

@@ -36,7 +36,7 @@ cp "$HERE/README-release.md" "$STAGE/$NAME/README.md"
 for lib in libcudart.so.12 libcublas.so.12 libcublasLt.so.12; do
     cp -L "${CUDA_HOME:-/usr/local/cuda}/lib64/$lib" "$STAGE/$CUDART/"
 done
-python3 "$HERE/provenance.py" "$ROOT" > "$STAGE/$NAME/build-info.json"
+python3 "$HERE/provenance.py" "$ROOT" "$BUILD" > "$STAGE/$NAME/build-info.json"
 cp "$STAGE/$NAME/build-info.json" "$OUT/build-info-linux.json"
 tar -czf "$OUT/$NAME.tar.gz" -C "$STAGE" "$NAME"
 tar -czf "$OUT/$CUDART.tar.gz" -C "$STAGE" "$CUDART"

@@ -1,0 +1,7 @@
+# Keep tracked files and Git metadata so the build reports the actual revision.
+/build*/
+/nariq-build/
+/nariq-dist/
+**/__pycache__/
+**/node_modules/
+.cache/
