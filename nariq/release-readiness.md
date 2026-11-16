@@ -19,13 +19,15 @@ These are runtime correctness checks. No scored benchmark needs to be resumed or
 | Platform | Implemented | Qualification needed |
 | --- | --- | --- |
 | Linux NVIDIA, compute capability 8.0+ | Coded linear CUDA kernels; coded embeddings on CPU | Candidate artifact parity and runtime checks |
-| Windows NVIDIA | CPU/CUDA source and native build recipe | Native build plus real GPU execution; earlier Wine CPU checks do not establish CUDA compatibility |
+| Windows NVIDIA | CPU/CUDA implementation; native artifact build and CPU startup checks passed | Real GPU execution and exact-package parity; a native build does not establish CUDA runtime correctness |
 | macOS Apple Silicon CPU | Portable scalar decoder with generic NEON product path | ARM CI, then full-model execution on a sufficiently large Mac |
 | Apple Metal | No custom trellis kernels | Separate backend implementation and hardware validation |
 | AMD HIP / Vulkan | No custom trellis kernels | Separate backend implementations; do not advertise NariQ GPU acceleration |
 | Older NVIDIA / CPU-only | CPU fallback | Slow execution; no GPU acceleration promise |
 
 Apple GPU support requires dispatch for the trellis operations, 1-6-bit tile decoding, scales, permutation gathers and Hadamard transforms, decode/prefill products that retain compressed weights, and correct fallback and tensor placement. A CPU build passing on macOS is not a substitute. Hosted ARM runners can run small numerical tests but do not have enough memory for meaningful 27B-model qualification.
+
+See [device-support.md](device-support.md) for the broader device matrix and implementation work needed beyond NVIDIA CUDA. Successful Linux and Windows artifact builds establish buildability and package startup; GPU execution remains a separate qualification gate.
 
 ## Correctness safeguards in this migration
 

@@ -86,3 +86,4 @@ ctest --test-dir build-cpu --output-on-failure \
 The CPU workflow runs Linux and Apple Silicon checks. CUDA build workflows run on relevant pull requests or manual dispatch and store artifacts only. The copied upstream publication workflows have been removed so a branch push cannot publish an upstream-style release.
 
 See [release-readiness.md](release-readiness.md) for the platform support boundary and validation still required before publication.
+See [device-support.md](device-support.md) for the implementation plan covering Apple, AMD, Intel, ARM64 and additional device classes.
