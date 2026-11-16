@@ -3,7 +3,7 @@
 llama.cpp with the NariQ trellis tensor types (TRL1-TRL6) that the Qwen3.8-27B trellis GGUFs use. Stock llama.cpp,
 Ollama and LM Studio cannot load those files.
 
-- Unpack this archive and the matching `cudart-nari-llama.cpp-...` archive into the same folder.
+- Create a destination folder, then extract this archive and the matching `cudart-nari-llama.cpp-...` archive with `tar -xzf ARCHIVE --strip-components=1 -C DESTINATION`. This places the programs and runtime libraries together.
 - Needs:
   - an NVIDIA driver of 570 or newer;
   - glibc 2.34 or newer (Ubuntu 22.04, Debian 12, RHEL 9 or newer);

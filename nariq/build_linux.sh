@@ -17,6 +17,11 @@ CUDART="cudart-nari-llama.cpp-$TAG-linux-cuda-$CUDA-x64"
 ARCHS="${CUDA_ARCHS:-50-virtual;61-virtual;70-virtual;75-virtual;80-virtual;86-real;89-real;90-virtual;120a-real}"
 args=("-DCMAKE_CUDA_ARCHITECTURES:STRING=$ARCHS")
 python3 "$HERE/prepare_ui.py"
+# Docker COPY changes file timestamps. Refresh Git's stat cache before CMake's
+# diff-index check so a clean copied checkout does not report a dirty build.
+if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git -C "$ROOT" status --porcelain --untracked-files=no >/dev/null
+fi
 cmake -S "$ROOT" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_RPATH='$ORIGIN' -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
     -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=ON \

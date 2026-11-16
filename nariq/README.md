@@ -54,7 +54,7 @@ docker buildx build -f nariq/Dockerfile --target artifacts \
 docker build -f nariq/Dockerfile -t nari-llama.cpp:local .
 ```
 
-The two archives contain programs/backends and CUDA runtime libraries, respectively. Both unpack into one directory. The program archive includes source revision, dirty status, source hashes and compiler/build settings in `build-info.json`, plus both licenses. `SHA256SUMS` covers both archives. Set `JOBS` to limit build parallelism; `CUDA_ARCHS` can reduce a development build's architecture set. A reduced-architecture build must not replace the all-architecture release candidate.
+The two archives contain programs/backends and CUDA runtime libraries, respectively. Extract each into a shared destination using `tar -xzf ARCHIVE --strip-components=1 -C DESTINATION`; each archive has its own top-level directory. The program archive includes source revision, dirty status, source hashes and compiler/build settings in `build-info.json`, plus both licenses. `SHA256SUMS` covers both archives. Set `JOBS` to limit build parallelism; `CUDA_ARCHS` can reduce a development build's architecture set. A reduced-architecture build must not replace the all-architecture release candidate.
 
 The package build downloads the UI pinned in `ui.json`, checks its SHA256, and fails if it cannot supply the chat page. It does not fall back to a mutable `latest` UI.
 
