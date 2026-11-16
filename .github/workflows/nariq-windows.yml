@@ -8,7 +8,7 @@ name: NariQ Windows artifacts
 on:
   workflow_dispatch:
   pull_request:
-    paths: ['ggml/**', 'src/**', 'nariq/**', '.github/workflows/nariq-windows.yml']
+    paths: ['app/**', 'cmake/**', 'common/**', 'ggml/**', 'include/**', 'src/**', 'tests/**', 'tools/**', 'vendor/**', 'scripts/**', 'nariq/**', 'CMakeLists.txt', '.github/workflows/nariq-windows.yml']
 
 permissions:
   contents: read

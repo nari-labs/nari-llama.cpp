@@ -8,8 +8,8 @@
 #   powershell -ExecutionPolicy Bypass -File run.ps1 -NoVision -Extra "-np","4","-c","131072"
 #
 # Environment: TRELLIS_HOME (download folder, %LOCALAPPDATA%\nari-llama.cpp); TRELLIS_RELEASE_URL, TRELLIS_MODEL_URL
-# and TRELLIS_TAG (mirrors and tests). Needs Windows 10 1803 or newer (curl.exe) and an NVIDIA driver of 572 or newer
-#. Without a GPU it runs on the CPU, slowly.
+# and TRELLIS_TAG (mirrors and tests). Needs Windows 10 1803 or newer (curl.exe) and an NVIDIA driver of 572 or newer.
+# Without a GPU it runs on the CPU, slowly.
 param(
     [ValidateSet("3.0", "2.5", "2.0", "3bit", "2.5bit", "2bit")][string]$Budget = "3.0",
     [int]$Port = 8080,
@@ -39,8 +39,13 @@ $Mmproj = @("Qwen3.8-27B-NariQ-mmproj-BF16.gguf", "8832425f593068d3278e08eda4c15
 $smi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
 $gpu = $null
 if ($smi) {
-    $gpu = (& nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>$null | Select-Object -First 1)
-    if ($LASTEXITCODE -ne 0) { $gpu = $null }
+    try {
+        $gpu = (& nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>$null | Select-Object -First 1)
+        if ($LASTEXITCODE -ne 0) { $gpu = $null }
+    } catch {
+        # Windows PowerShell 5.1 can turn native stderr into a terminating error.
+        $gpu = $null
+    }
 }
 if ($gpu -and $gpu -match '^.+,\s*(\d+)\.\d+.*,') {
     Write-Host "GPU: $gpu"
