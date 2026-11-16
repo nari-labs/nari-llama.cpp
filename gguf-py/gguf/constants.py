@@ -7042,7 +7042,7 @@ class GGMLQuantizationType(IntEnum):
     Q1_0    = 41
     Q2_0    = 42
     F8_E4M3 = 43
-    # trellis fork: trellis-coded weights at 1-6 bits (docs/llamacpp.md in the quantization repository)
+    # NariQ: trellis-coded weights at 1-6 bits (see nariq/FORMAT.md).
     TRL1 = 44
     TRL2 = 45
     TRL3 = 46
