@@ -2823,6 +2823,70 @@ struct test_trellis_mlp : public test_case {
     }
 };
 
+// GGML_OP_TRELLIS on one input with several output sides and widths, then a concat: an input group, which a backend may
+// run with one product launch and one launch for the members' blockwise output sides
+struct test_trellis_group : public test_case {
+    const int64_t k;
+    const int64_t t;
+
+    std::string vars() override {
+        return VARS_TO_STR2(k, t);
+    }
+
+    double max_nmse_err() override {
+        return 1e-5;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "TRELLIS";
+    }
+
+    test_trellis_group(int64_t k, int64_t t) : k(k), t(t) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, t);
+        ggml_set_name(x, "x");
+
+        auto linear = [&](ggml_type type, int64_t n, const trellis_side & rows, bool gather) {
+            ggml_tensor * w    = ggml_new_tensor_2d(ctx, type, k, n);
+            ggml_tensor * s16  = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, k / 16);
+            ggml_tensor * pre  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+            ggml_tensor * post = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+            ggml_tensor * pout = gather ? ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n) : nullptr;
+            const std::vector<int32_t> desc = trellis_desc(rows, {1, 128, 1}, { (int32_t) n });
+            return ggml_trellis_mul_mat(ctx, w, x, s16, pre, post, nullptr, pout, desc.data(), (int) desc.size());
+        };
+        // the members of a delta-net layer's and an attention layer's input groups, scaled down, as consecutive nodes
+        ggml_tensor * m[6] = {
+            linear(GGML_TYPE_TRL3, 4096, {1, 2048, 1}, true),
+            linear(GGML_TYPE_TRL4, 2048, {1, 2048, 1}, true),
+            linear(GGML_TYPE_TRL4, 4096, {1, 4096, 1}, false),
+            linear(GGML_TYPE_TRL5, 1024, {1, 1024, 1}, true),
+            linear(GGML_TYPE_TRL2,  512, {1,  256, 1}, false),
+            linear(GGML_TYPE_TRL5,   48, {0,    0, 1}, true),
+        };
+        if (mode == MODE_TEST) {
+            for (ggml_tensor * t : m) {
+                ggml_build_forward_expand(gf, t);
+            }
+        }
+        ggml_tensor * out = m[0];
+        for (int i = 1; i < 6; ++i) {
+            out = ggml_concat(ctx, out, m[i], 0);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_trellis_tensors(ctx, 2468, 0);
+    }
+};
+
 // GGML_OP_TRELLIS_GET_ROWS: rows of a coded embedding; banded, the rows are split into two bands that each write
 // their own rows in place through a vocabulary gather (ggml_trellis_get_rows_band)
 struct test_trellis_get_rows : public test_case {
@@ -11020,6 +11084,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_trellis_get_rows(type, k, 96, 7, cols, banded));
             }
         }
+    }
+
+    for (int64_t t : {1, 8}) {
+        test_cases.emplace_back(new test_trellis_group(512, t));
     }
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));

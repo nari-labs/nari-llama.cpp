@@ -157,12 +157,12 @@ __global__ void __launch_bounds__(1024) rht_cta_k(const float* __restrict__ x, i
 // bank conflicts), the rest in registers. Each thread rewrites only the cells it read, so the transpose back needs no
 // barrier before it. GATHER: x[idx[k]] in place of x[k] (and no post).
 template <int B, int THREADS, bool GATHER>
-__global__ void rht_row_k(const float* x, const int32_t* idx, float* y, float c, const float* pre, const float* post) {
+__device__ __forceinline__ void rht_row(const float* x, const int32_t* idx, float* y, float c, const float* pre,
+                                        const float* post, int base) {
     static_assert(B % THREADS == 0 && THREADS % 32 == 0 && THREADS <= 1024, "a CTA of whole warps covers the block");
     constexpr int VALUES = B / THREADS;
     constexpr int COL = B < 1024 ? B / 32 : 32;
     __shared__ float tile[B / 32][33];
-    const int base = blockIdx.x * B;
     const int tid = threadIdx.x, lane = tid % 32;
 #pragma unroll
     for (int i = 0; i < VALUES; ++i) {
@@ -211,6 +211,30 @@ __global__ void rht_row_k(const float* x, const int32_t* idx, float* y, float c,
         const float z = tile[k / 32][lane] * c;
         y[base + k] = !GATHER && post ? z * post[base + k] : z;
     }
+}
+
+template <int B, int THREADS, bool GATHER>
+__global__ void rht_row_k(const float* x, const int32_t* idx, float* y, float c, const float* pre, const float* post) {
+    rht_row<B, THREADS, GATHER>(x, idx, y, c, pre, post, blockIdx.x * B);
+}
+
+// tq_rht_rows: the rows of several vectors with one block size, in place, one launch; grid: each vector's blocks in turn
+constexpr int MAX_ROWS_SET = 8;
+struct RowsSet {
+    float* y[MAX_ROWS_SET];
+    const float* post[MAX_ROWS_SET];
+    int cta0[MAX_ROWS_SET];  // each vector's first CTA
+    int n;
+    float c;
+};
+
+template <int B, int THREADS>
+__global__ void rht_rows_k(const __grid_constant__ RowsSet set) {
+    int m = 0;
+#pragma unroll
+    for (int i = 1; i < MAX_ROWS_SET; ++i)
+        if (i < set.n && (int)blockIdx.x >= set.cta0[i]) m = i;
+    rht_row<B, THREADS, false>(set.y[m], nullptr, set.y[m], set.c, nullptr, set.post[m], (blockIdx.x - set.cta0[m]) * B);
 }
 
 // ---- tq_hadfull: two kernels, each fully parallel ------------------------------------------------------------
@@ -396,11 +420,13 @@ int tq_rht(const float* x, int64_t x_stride, float* y, int64_t y_stride, int row
     const float c = static_cast<float>(std::pow(static_cast<double>(block), -0.5));  // Python's block ** -0.5
     cudaStream_t s = static_cast<cudaStream_t>(stream);
     cudaError_t e;
-    if (rows == 1 && block >= 256 && block <= 1024) {
+    if (rows == 1 && block >= 256 && block <= 4096) {
         switch (block) {
             case 256: rht_row_k<256, 256, false><<<n / block, 256, 0, s>>>(x, nullptr, y, c, pre, post); break;
             case 512: rht_row_k<512, 256, false><<<n / block, 256, 0, s>>>(x, nullptr, y, c, pre, post); break;
-            default: rht_row_k<1024, 256, false><<<n / block, 256, 0, s>>>(x, nullptr, y, c, pre, post); break;
+            case 1024: rht_row_k<1024, 256, false><<<n / block, 256, 0, s>>>(x, nullptr, y, c, pre, post); break;
+            case 2048: rht_row_k<2048, 1024, false><<<n / block, 1024, 0, s>>>(x, nullptr, y, c, pre, post); break;
+            default: rht_row_k<4096, 1024, false><<<n / block, 1024, 0, s>>>(x, nullptr, y, c, pre, post); break;
         }
         return tq::check(cudaGetLastError(), "tq_rht launch");
     }
@@ -433,6 +459,33 @@ int tq_rht_gather(const float* x, const int32_t* idx, float* y, int n, int block
         default: rht_row_k<4096, 1024, true><<<n / block, 1024, 0, s>>>(x, idx, y, c, pre, nullptr); break;
     }
     return tq::check(cudaGetLastError(), "tq_rht_gather launch");
+}
+
+int tq_rht_rows(int n, float* const* y, const int* len, const float* const* post, int block, void* stream) {
+    if (n < 1 || n > MAX_ROWS_SET || y == nullptr || len == nullptr || block < 256 || block > 4096 ||
+        (block & (block - 1)))
+        return tq::fail(TQ_E_ARG, "tq_rht_rows: 1-8 vectors, block a power of two in 256-4096");
+    RowsSet set{};
+    set.n = n;
+    set.c = static_cast<float>(std::pow(static_cast<double>(block), -0.5));
+    int ctas = 0;
+    for (int i = 0; i < n; ++i) {
+        if (y[i] == nullptr || len[i] < block || len[i] % block)
+            return tq::fail(TQ_E_ARG, "tq_rht_rows: every vector a multiple of block");
+        set.y[i] = y[i];
+        set.post[i] = post != nullptr ? post[i] : nullptr;
+        set.cta0[i] = ctas;
+        ctas += len[i] / block;
+    }
+    cudaStream_t s = static_cast<cudaStream_t>(stream);
+    switch (block) {
+        case 256: rht_rows_k<256, 256><<<ctas, 256, 0, s>>>(set); break;
+        case 512: rht_rows_k<512, 256><<<ctas, 256, 0, s>>>(set); break;
+        case 1024: rht_rows_k<1024, 256><<<ctas, 256, 0, s>>>(set); break;
+        case 2048: rht_rows_k<2048, 1024><<<ctas, 1024, 0, s>>>(set); break;
+        default: rht_rows_k<4096, 1024><<<ctas, 1024, 0, s>>>(set); break;
+    }
+    return tq::check(cudaGetLastError(), "tq_rht_rows launch");
 }
 
 int tq_hadfull(const float* x, int64_t x_stride, float* y, int64_t y_stride, int rows, int n, const int* parts,

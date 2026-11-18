@@ -193,6 +193,14 @@ static void trellis_product(ggml_backend_cuda_context & ctx, const trellis_op & 
 static const int TRELLIS_GROUP_MAX = 8;            // tq_gemv_group's members
 static const int64_t TRELLIS_GROUP_OUTPUTS = 2097152;  // and its outputs in all
 
+// a member's blockwise output side at one column, run by tq_rht_rows with the others of its block size
+struct trellis_rows_side {
+    float * y;
+    int n;
+    const float * post;
+    int block;
+};
+
 // a node that can join an input group: a coded linear at up to 64 columns, no input gather, an input side the GEMV fuses
 static bool trellis_groupable(const ggml_tensor * t) {
     if (t->op != GGML_OP_TRELLIS || (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || !ggml_cuda_trellis_supported(t)) {
@@ -268,16 +276,43 @@ static void trellis_group(ggml_backend_cuda_context & ctx, ggml_tensor * const *
     if (!sides) {
         return;
     }
-    // the output sides, then every member's output gather in one launch
+    // the output sides (at one column, the blockwise ones in one launch per block size), then every member's output
+    // gather in one launch
+    trellis_rows_side rows[TRELLIS_GROUP_MAX];
+    int nrows = 0;
     trellis_gather_set set = {};
     int nseg = 0, nmax = 0;
     for (int i = 0; i < n; ++i) {
         const trellis_op o(nodes[i]);
-        trellis_out(o, (float *) outs[i], (float *) nodes[i]->data, stream, false);
+        if (T == 1 && o.rows_kind == 1 && !o.out_fused() && o.rows_block >= 256 && o.rows_block <= 4096) {
+            rows[nrows++] = {(float *) outs[i], o.N, (const float *) o.post->data, o.rows_block};
+        } else {
+            trellis_out(o, (float *) outs[i], (float *) nodes[i]->data, stream, false);
+        }
         if (o.pout != nullptr) {
             set.seg[nseg++] = {(const float *) outs[i], (const int32_t *) o.pout->data, (float *) nodes[i]->data, o.N};
             nmax = std::max(nmax, o.N);
         }
+    }
+    for (int i = 0; i < nrows; ++i) {
+        const int block = rows[i].block;
+        if (block == 0) {
+            continue;
+        }
+        float * y[TRELLIS_GROUP_MAX];
+        int len[TRELLIS_GROUP_MAX];
+        const float * post[TRELLIS_GROUP_MAX];
+        int m = 0;
+        for (int j = i; j < nrows; ++j) {
+            if (rows[j].block == block) {
+                y[m]    = rows[j].y;
+                len[m]  = rows[j].n;
+                post[m] = rows[j].post;
+                rows[j].block = 0;
+                ++m;
+            }
+        }
+        TRELLIS_CHECK(tq_rht_rows(m, y, len, post, block, stream));
     }
     if (nseg > 0) {
         const int threads = 256;

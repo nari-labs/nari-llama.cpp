@@ -143,6 +143,11 @@ int tq_rht(const float* x, int64_t x_stride, float* y, int64_t y_stride, int row
 // gather followed by tq_rht. idx: n int32 indices into x. y must not overlap x.
 int tq_rht_gather(const float* x, const int32_t* idx, float* y, int n, int block, const float* pre, void* stream);
 
+// tq_rht of n <= 8 single rows (vectors y[i] of len[i] entries) that share one block (256-4096), in place, in one
+// launch: y[i] = post[i] * H_b(y[i]) on each run of `block` entries, the same bits as one tq_rht per vector. post: n
+// fp32 vectors, or null (none).
+int tq_rht_rows(int n, float* const* y, const int* len, const float* const* post, int block, void* stream);
+
 // A whole-slice side (trellis.hadfull): the n entries are `nparts` fused parts in stored order, each cut in `shards`
 // equal contiguous shards; slice r is shard r of every part, side by side (one slice of all n when shards = 1). Each
 // slice of length L = n / shards = m 2^k (m the smallest of 1, 12, 20, 68 that leaves a power of two) is multiplied
