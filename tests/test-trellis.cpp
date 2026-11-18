@@ -272,11 +272,11 @@ int main(int argc, char ** argv) {
         auto * pre = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 256);
         auto * post = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
         const int32_t rotated[] = {1, 128, 1, 0, 0, 1, 1, 128};
-        check(!ggml_backend_supports_op(backend, ggml_get_rows(ctx, w, ids)), "CPU accepts get_rows on a coded weight");
-        check(!ggml_backend_supports_op(backend, ggml_mul_mat(ctx, w, x)), "CPU accepts mul_mat on a coded weight");
-        check(!ggml_backend_supports_op(backend, ggml_mul_mat_id(ctx, e, ggml_reshape_3d(ctx, x, 256, 1, 4), eids)),
+        check(!ggml_backend_supports_op(cpu, ggml_get_rows(ctx, w, ids)), "CPU accepts get_rows on a coded weight");
+        check(!ggml_backend_supports_op(cpu, ggml_mul_mat(ctx, w, x)), "CPU accepts mul_mat on a coded weight");
+        check(!ggml_backend_supports_op(cpu, ggml_mul_mat_id(ctx, e, ggml_reshape_3d(ctx, x, 256, 1, 4), eids)),
             "CPU accepts mul_mat_id on coded experts");
-        check(!ggml_backend_supports_op(backend, ggml_trellis_get_rows(ctx, w, ids, s, pre, post, rotated, 8)),
+        check(!ggml_backend_supports_op(cpu, ggml_trellis_get_rows(ctx, w, ids, s, pre, post, rotated, 8)),
             "CPU accepts embedding rows with a rotated row side");
         ggml_free(ctx);
     }
