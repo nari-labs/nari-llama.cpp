@@ -1,6 +1,9 @@
 find_package(Threads REQUIRED)
 
 if (GGML_CPU)
+    add_executable(test-trellis-model test-trellis-model.cpp)
+    target_compile_features(test-trellis-model PRIVATE cxx_std_17)
+    target_link_libraries(test-trellis-model PRIVATE llama ggml vendor::nlohmann)
     add_executable(test-trellis test-trellis.cpp)
     target_compile_features(test-trellis PRIVATE cxx_std_17)
     target_link_libraries(test-trellis PRIVATE ggml)
