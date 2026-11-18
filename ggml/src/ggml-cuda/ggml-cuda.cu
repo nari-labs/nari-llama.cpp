@@ -4337,6 +4337,48 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// ADD, then RMS_NORM of the sum, then MUL of the norm, with the sum used later as well (a residual stream)
+static bool ggml_cuda_can_fuse_add_rms_norm_mul(const ggml_cgraph * cgraph, int i) {
+    const ggml_op ops[3]     = { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
+    const int     outputs[2] = { i, i + 2 };
+    if (!ggml_can_fuse_subgraph(cgraph, i, 3, ops, outputs, 2)) {
+        return false;
+    }
+    const ggml_tensor * add  = cgraph->nodes[i];
+    const ggml_tensor * norm = cgraph->nodes[i + 1];
+    const ggml_tensor * mul  = cgraph->nodes[i + 2];
+    if (norm->src[0] != add || (mul->src[0] != norm && mul->src[1] != norm)) {
+        return false;
+    }
+    const ggml_tensor * weight = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+    for (const ggml_tensor * t : std::initializer_list<const ggml_tensor *>{ add->src[0], add->src[1], add, norm, mul }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || !ggml_are_same_shape(t, add)) {
+            return false;
+        }
+    }
+    if (weight->type != GGML_TYPE_F32 || !ggml_is_contiguous(weight) || weight->ne[0] != add->ne[0] || ggml_nrows(weight) != 1) {
+        return false;
+    }
+    // each thread reads every input at an index before it writes the outputs at that index,
+    // so an output may alias an input exactly, but no tensor may overlap another one partially
+    auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data;
+        const char * b0 = (const char *) b->data;
+        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+    };
+    for (const ggml_tensor * out : { add, mul }) {
+        for (const ggml_tensor * in : std::initializer_list<const ggml_tensor *>{ add->src[0], add->src[1] }) {
+            if (in->data != out->data && overlap(in, out)) {
+                return false;
+            }
+        }
+        if (overlap(weight, out)) {
+            return false;
+        }
+    }
+    return !overlap(add, mul);
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4345,6 +4387,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // measured for single-token decode of models with coded linears only, so not enabled for other graphs yet
+    if (node->op == GGML_OP_ADD && cuda_ctx->graph_has_trellis_op && ggml_nrows(node) == 1 &&
+            cuda_ctx->stream_context().concurrent_events.empty() && ggml_cuda_can_fuse_add_rms_norm_mul(cgraph, i)) {
+        ggml_cuda_op_add_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        return 2;
+    }
 
     // trellis fork: an MLP's up/gate, swiglu and down as one chain; consecutive coded linears of one x as an input group
     if (node->op == GGML_OP_TRELLIS && cuda_ctx->stream_context().concurrent_events.empty()) {
