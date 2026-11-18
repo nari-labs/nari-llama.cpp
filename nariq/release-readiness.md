@@ -1,14 +1,16 @@
 # NariQ release readiness
 
-This checklist describes the fork candidate, not a published release. Historical tests of the previous b12375-based runtime are evidence for the implementation, not validation of this newer upstream revision.
+This checklist describes the fork candidate, not a published release. Exact-candidate CUDA results, artifact hashes and remaining blockers are recorded in [cuda-qualification.md](cuda-qualification.md). Historical tests of the previous b12375-based runtime alone do not qualify this revision.
 
 ## Linux/NVIDIA release gates
 
-- [ ] CPU CI and CUDA artifact builds pass on the candidate commit.
-- [ ] Test the exact packaged artifact against the existing BF16-decode reference: text, tools, vision, long context, all three weight budgets, and concurrent requests.
-- [ ] Recheck full and partial GPU offload on the new build. Partial offload was tested successfully on A10/L4 in the previous runtime, including 16 GiB budgets and a 124K-token needle; it is not an entirely unimplemented feature.
+- [x] Linux and Windows CUDA artifact builds and available CPU checks pass for the frozen candidate. Apple CPU CI remains unverified because hosted runner capacity was unavailable.
+- [x] Exercise the exact packaged artifact: text, tools, vision, 26K context, all three weight budgets and eight concurrent requests. The BF16 references also pass the functional suite.
+- [x] Diagnose the reference mismatch and verify same-weight kernel parity. Direct-GGUF F32 references pass all three budgets at mean KL <= 0.001 and top-1 >= 98%, including prefill-reference/decode comparisons. The reference generator and CPU tests are included.
+- [ ] Review BF16 cross-precision acceptance: corrected once-rounded BF16 references still exceed the fixed KL limit. Preserve the original failures and the corrected diagnostics; do not label the BF16 gate passed. See [cuda-qualification.md](cuda-qualification.md).
+- [x] Recheck full and partial GPU offload on the exact candidate. H100 passed explicit 16/65-layer offload. L4 with 16 GiB available passed automatic 49/65-layer offload in a 128K context and retrieved a needle from a 123,323-token prompt.
 - [ ] Exercise one real 16/24 GB GeForce card before claiming consumer qualification. Historical datacenter checks covered A10, L4, L40S, A100, H100, B200 and RTX PRO 6000.
-- [ ] Verify candidate checksums and clean-download launcher behavior with the exact model files. Confirm the served build reports the candidate commit.
+- [x] Verify candidate checksums and clean-download Linux launcher behavior with the exact model files. The served build reports `b12440-459d5976a`, matching the clean artifact revision.
 - [ ] Confirm the model-card commands, candidate tag, driver requirements and supported platforms match the artifacts.
 - [ ] Obtain publication approval. Build workflows never publish releases or container images.
 
@@ -18,7 +20,7 @@ These are runtime correctness checks. No scored benchmark needs to be resumed or
 
 | Platform | Implemented | Qualification needed |
 | --- | --- | --- |
-| Linux NVIDIA, compute capability 8.0+ | Coded linear CUDA kernels; coded embeddings on CPU | Candidate artifact parity and runtime checks |
+| Linux NVIDIA, compute capability 8.0+ | Coded linear CUDA kernels; coded embeddings on CPU | Functional checks passed; numerical acceptance and real GeForce qualification remain open |
 | Windows NVIDIA | CPU/CUDA implementation; native artifact build and CPU startup checks passed | Real GPU execution and exact-package parity; a native build does not establish CUDA runtime correctness |
 | macOS Apple Silicon CPU | Portable scalar decoder with generic NEON product path | ARM CI, then full-model execution on a sufficiently large Mac |
 | Apple Metal | No custom trellis kernels | Separate backend implementation and hardware validation |

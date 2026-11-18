@@ -10,9 +10,9 @@
 #
 # Options: --port N (8080), --host ADDR (127.0.0.1), --no-vision, --docker, --download-only.
 # Environment: TRELLIS_HOME (download folder, ~/.cache/nari-llama.cpp); TRELLIS_RELEASE_URL, TRELLIS_MODEL_URL,
-# TRELLIS_IMAGE and TRELLIS_TAG (mirrors and tests). Needs curl, tar, sha256sum, an NVIDIA driver of 570 or newer
-#, glibc 2.34 or newer and libgomp (Ubuntu 22.04, Debian 12, RHEL 9 or newer). Without a
-# GPU it runs on the CPU, slowly.
+# TRELLIS_IMAGE and TRELLIS_TAG (mirrors and tests). Needs curl, tar, sha256sum, an NVIDIA driver of 570 or newer,
+# glibc 2.34 or newer, libstdc++ with GLIBCXX_3.4.30, and libgomp (updated Ubuntu 22.04 or Debian 12).
+# Without a GPU it runs on the CPU, slowly.
 set -euo pipefail
 
 if [ "${BASH_VERSINFO[0]}" -lt 4 ] || [ "$(uname -s)" != Linux ] || [ "$(uname -m)" != x86_64 ]; then

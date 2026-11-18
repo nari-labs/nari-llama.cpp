@@ -78,6 +78,7 @@ The assembler verifies input hashes, requires the program/runtime pairs from the
 ## Checks and release gates
 
 ```sh
+python3 -m pip install -e ./gguf-py
 python3 -m unittest discover -s nariq/tests -v
 ctest --test-dir build-cpu --output-on-failure \
   -R 'test-(trellis|trellis-metadata|gguf|quantize-fns|chat|grammar-parser|sampling)$'
@@ -85,5 +86,6 @@ ctest --test-dir build-cpu --output-on-failure \
 
 The CPU workflow runs Linux and Apple Silicon checks. CUDA build workflows run on relevant pull requests or manual dispatch and store artifacts only. The copied upstream publication workflows have been removed so a branch push cannot publish an upstream-style release.
 
+See [VALIDATION.md](VALIDATION.md) for direct-GGUF numerical references and KL comparison requirements.
 See [release-readiness.md](release-readiness.md) for the platform support boundary and validation still required before publication.
 See [device-support.md](device-support.md) for the implementation plan covering Apple, AMD, Intel, ARM64 and additional device classes.
