@@ -2545,10 +2545,29 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
         // blocks that are not model layers (e.g. the blocks of a head) go with the output
         buft_list_layer = (size_t) tn.bid < pimpl->dev_layer.size() ? pimpl->dev_layer.at(tn.bid).buft_list : pimpl->dev_output.buft_list;
     }
+    // a coded weight is read only by the trellis ops that build_lora_mm and build_inp_embd emit, with the sides
+    // created below; any other use would reach a plain op that no backend runs on a coded type
+    const ggml_tensor * meta = ml.get_tensor_meta(tn.str().c_str());
+    if (meta != nullptr && ggml_is_trellis_type(meta->type) && !(flags & TENSOR_SKIP)) {
+        if (flags & TENSOR_DUPLICATED) {
+            throw std::runtime_error(format("trellis: %s is coded and also used as another tensor (a tied embedding); "
+                    "coded tensors cannot be shared", tn.str().c_str()));
+        }
+        ggml_op op = GGML_OP_NONE;
+        try {
+            op = llm_tensor_info_for(tn.tensor).op;
+        } catch (const std::out_of_range &) {
+            // ml.create_tensor reports the missing mapping
+        }
+        if (op != GGML_OP_NONE && op != GGML_OP_MUL_MAT && !(op == GGML_OP_GET_ROWS && tn.tensor == LLM_TENSOR_TOKEN_EMBD)) {
+            throw std::runtime_error(format("trellis: %s is coded, but only linear weights and the token embedding can be "
+                    "(this tensor is used by %s)", tn.str().c_str(), ggml_op_name(op)));
+        }
+    }
     ggml_tensor * t = ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
-    if (t != nullptr && ggml_is_trellis_type(t->type) && !(flags & TENSOR_DUPLICATED)) {
+    if (t != nullptr && ggml_is_trellis_type(t->type)) {
         create_trellis_sides(ml, tn, t);
     }
     return t;

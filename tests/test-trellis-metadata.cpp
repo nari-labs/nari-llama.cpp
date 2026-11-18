@@ -189,6 +189,15 @@ int main() {
         fixture f(false, false, GGML_TYPE_F32);
         check_load("a gather of the wrong type must be rejected", f, "output.trellis_pin is f32, expected i32");
     }
+    {
+        fixture f(true, false);
+        check_load("a coded tied embedding must be rejected", f, "token_embd.weight is coded and also used as another tensor");
+    }
+    {
+        fixture f(false, true);
+        check_load("coded expert weights must be rejected", f,
+                "blk.0.ffn_gate_exps.weight is coded, but only linear weights and the token embedding can be");
+    }
 
-    std::puts("trellis loading: format versions and gathers checked");
+    std::puts("trellis loading: format versions, gathers, tied embeddings and expert weights checked");
 }
