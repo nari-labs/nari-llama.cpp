@@ -308,9 +308,14 @@ def main() -> None:
             if args.mtp:
                 model_class.mtp_only = True
 
-        # trellis fork: a native trellis export (quantization_config.quant_method native_trellis) of Qwen3.5 / 3.8
-        if (hparams.get("quantization_config") or {}).get("quant_method") == "native_trellis":
+        # trellis fork: a native trellis export (quantization_config.quant_method native_trellis) keeps its codes;
+        # only the dense Qwen3.5 text conversion knows how to write them
+        if model_type == ModelType.TEXT and (hparams.get("quantization_config") or {}).get("quant_method") == "native_trellis":
+            from conversion.qwen import Qwen3_5TextModel
             from conversion.trellis import TrellisQwen35Model
+            if model_class is not Qwen3_5TextModel:
+                logger.error(f"native_trellis exports are supported only for Qwen3.5 dense text models, not {hparams.get('architectures')}")
+                sys.exit(1)
             model_class = TrellisQwen35Model
 
         model_instance = model_class(dir_model, output_type, fname_out,
