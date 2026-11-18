@@ -15,6 +15,7 @@
 //    split order (deterministic), applies 1/4, the optional output Hadamard and post, and stores out.
 #include <cuda_bf16.h>
 
+#include <cmath>
 #include <cstdio>
 
 #include "common.cuh"
@@ -424,6 +425,25 @@ __global__ void __launch_bounds__(256) prepare_multi_k(const T* __restrict__ x, 
         prep_block(v, t, c, (rows + 7) / 8, p.pre[m], p.had[m], p.s16[m], p.xf[m], p.xs[m]);
 }
 
+// one row's input side x_rot = H_B(pre * x[idx]) / sqrt(B) (one CTA per block of B entries, tq_rht_gather's stages)
+// and its activations as prepare_k makes them from x_rot, without x_rot in memory: the same bits
+template <int B, int THREADS>
+__global__ void __launch_bounds__(THREADS) prepare_rht_k(const float* __restrict__ x, const int32_t* __restrict__ idx,
+                                                          const float* __restrict__ pre, float c,
+                                                          const __half* __restrict__ s16, __half* __restrict__ xf,
+                                                          float* __restrict__ xs, int* counters, int count) {
+    clear_counters(counters, count);
+    __shared__ float tile[B / 32][33];
+    tq::rht_row_stages<B, THREADS>(x, idx, pre, blockIdx.x * B, tile);
+    const int lane = threadIdx.x % 32;
+    for (int w = threadIdx.x / 32; w < B / 128; w += THREADS / 32) {
+        float v[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) v[i] = tile[4 * w + i][lane] * c;
+        prep_block(v, 0, (blockIdx.x * B) / 128 + w, 1, nullptr, 0, s16, xf, xs);
+    }
+}
+
 // ---- host side -----------------------------------------------------------------------------------------------------
 
 size_t align256(size_t b) { return (b + 255) / 256 * 256; }
@@ -536,6 +556,31 @@ size_t group_layout(int n, const tq_matrix* ms, int rows, size_t* xf, size_t* xs
     return off;
 }
 
+// the GEMV of activations a prepare launch has put in the workspace (whose counters it zeroed): one launch for the width
+int gemv_prepared(const tq_matrix* m, int rows, char* w, const Layout& l, void* out, tq_dtype out_type,
+                  int64_t out_stride, const float* post, int flags, cudaStream_t s) {
+    const int kt = m->K / 16, nt = m->N / 16, kb = split_kb(kt, nt, rows), cbs = (nt + W4 - 1) / W4;
+    Args a;
+    a.codes = static_cast<const uint32_t*>(m->codes);
+    a.kt = kt, a.nt = nt, a.sk = m->tile_stride_k, a.sn = m->tile_stride_n;
+    a.xf = reinterpret_cast<const uint32_t*>(w + l.xf);
+    a.xs = reinterpret_cast<const float*>(w + l.xs);
+    a.rows = rows, a.kb = kb, a.splits = (kt + kb - 1) / kb;
+    a.ws = reinterpret_cast<float*>(w + l.part);
+    a.counters = reinterpret_cast<int*>(w + l.counters);
+    a.out = out, a.out_type = out_type, a.out_stride = out_stride;
+    a.post = post, a.had = (flags & TQ_HAD128_OUT) ? 1 : 0, a.mult = m->mult;
+    cudaError_t e;
+    switch (m->bits) {
+        case 1: e = launch_k<1>(a, cbs, s); break;
+        case 2: e = launch_k<2>(a, cbs, s); break;
+        case 3: e = launch_k<3>(a, cbs, s); break;
+        case 4: e = launch_k<4>(a, cbs, s); break;
+        case 5: e = launch_k<5>(a, cbs, s); break;
+        default: e = launch_k<6>(a, cbs, s); break;
+    }
+    return tq::check(e, "tq_gemv launch");
+}
 }  // namespace
 
 namespace tq {
@@ -591,27 +636,41 @@ int tq_gemv(const tq_matrix* m, const void* x, tq_dtype x_type, int64_t x_stride
     if (cudaError_t e = tq::prepare(x, x_type, x_stride, rows, m->K, pre, (flags & TQ_HAD128_IN) ? 1 : 0,
                                      m->block_scale, w + l.xf, w + l.xs, s, counters, cbs))
         return tq::check(e, "tq_gemv prepare launch");
-    const int kt = m->K / 16, nt = m->N / 16, kb = split_kb(kt, nt, rows);
-    Args a;
-    a.codes = static_cast<const uint32_t*>(m->codes);
-    a.kt = kt, a.nt = nt, a.sk = m->tile_stride_k, a.sn = m->tile_stride_n;
-    a.xf = reinterpret_cast<const uint32_t*>(w + l.xf);
-    a.xs = reinterpret_cast<const float*>(w + l.xs);
-    a.rows = rows, a.kb = kb, a.splits = (kt + kb - 1) / kb;
-    a.ws = reinterpret_cast<float*>(w + l.part);
-    a.counters = counters;
-    a.out = out, a.out_type = out_type, a.out_stride = out_stride;
-    a.post = post, a.had = (flags & TQ_HAD128_OUT) ? 1 : 0, a.mult = m->mult;
-    cudaError_t e;
-    switch (m->bits) {
-        case 1: e = launch_k<1>(a, cbs, s); break;
-        case 2: e = launch_k<2>(a, cbs, s); break;
-        case 3: e = launch_k<3>(a, cbs, s); break;
-        case 4: e = launch_k<4>(a, cbs, s); break;
-        case 5: e = launch_k<5>(a, cbs, s); break;
-        default: e = launch_k<6>(a, cbs, s); break;
+    return gemv_prepared(m, rows, w, l, out, out_type, out_stride, post, flags, s);
+}
+
+int tq_gemv_rht(const tq_matrix* m, const float* x, const int32_t* idx, int block, const float* pre, void* out,
+                tq_dtype out_type, const float* post, int flags, void* ws, size_t ws_bytes, void* stream) {
+    if (int e = tq::check_matrix(m, 128, "tq_gemv_rht")) return e;
+    if (x == nullptr || out == nullptr || out_type < TQ_F32 || out_type > TQ_F16 || block < 256 || block > 4096 ||
+        (block & (block - 1)) || m->K % block || (flags & TQ_HAD128_IN))
+        return tq::fail(TQ_E_ARG, "tq_gemv_rht: block a power of two in 256-4096 dividing K, no TQ_HAD128_IN");
+    if ((flags & TQ_HAD128_OUT) && m->N % 128)
+        return tq::fail(TQ_E_ARG, "tq_gemv_rht: TQ_HAD128_OUT needs N % 128 == 0");
+    if (tq::device_cc() < 80) return tq::fail(TQ_E_ARCH, "tq_gemv_rht: needs sm_80 or newer (mma.sync m16n8k16)");
+    if ((m->N / 16 + W4 - 1) / W4 > TQ_GEMV_COUNTER_BYTES / (int)sizeof(int))
+        return tq::fail(TQ_E_ARG, "tq_gemv_rht: N above the counters' capacity (2,097,152 outputs)");
+    const Layout l = layout(m->K, m->N, 1);
+    if (ws == nullptr || ws_bytes < l.total || reinterpret_cast<uintptr_t>(ws) % 256)
+        return tq::fail(TQ_E_WORKSPACE, "tq_gemv_rht: workspace smaller than tq_gemv_workspace_bytes (or not 256-aligned)");
+    cudaStream_t s = static_cast<cudaStream_t>(stream);
+    char* w = static_cast<char*>(ws);
+    const int cbs = (m->N / 16 + W4 - 1) / W4;
+    int* counters = reinterpret_cast<int*>(w + l.counters);
+    const float c = static_cast<float>(std::pow(static_cast<double>(block), -0.5));  // as tq_rht_gather
+    const __half* sc = static_cast<const __half*>(m->block_scale);
+    __half* xf = reinterpret_cast<__half*>(w + l.xf);
+    float* xs = reinterpret_cast<float*>(w + l.xs);
+    const unsigned blocks = m->K / block;
+    switch (block) {
+        case 256: prepare_rht_k<256, 256><<<blocks, 256, 0, s>>>(x, idx, pre, c, sc, xf, xs, counters, cbs); break;
+        case 512: prepare_rht_k<512, 512><<<blocks, 512, 0, s>>>(x, idx, pre, c, sc, xf, xs, counters, cbs); break;
+        case 1024: prepare_rht_k<1024, 1024><<<blocks, 1024, 0, s>>>(x, idx, pre, c, sc, xf, xs, counters, cbs); break;
+        case 2048: prepare_rht_k<2048, 1024><<<blocks, 1024, 0, s>>>(x, idx, pre, c, sc, xf, xs, counters, cbs); break;
+        default: prepare_rht_k<4096, 1024><<<blocks, 1024, 0, s>>>(x, idx, pre, c, sc, xf, xs, counters, cbs); break;
     }
-    return tq::check(e, "tq_gemv launch");
+    if (cudaError_t e = cudaGetLastError()) return tq::check(e, "tq_gemv_rht prepare launch");
+    return gemv_prepared(m, 1, w, l, out, out_type, m->N, post, flags, s);
 }
 
 size_t tq_gemv_group_workspace_bytes(int n, const tq_matrix* ms, int rows) {

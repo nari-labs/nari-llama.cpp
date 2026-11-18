@@ -152,61 +152,16 @@ __global__ void __launch_bounds__(1024) rht_cta_k(const float* __restrict__ x, i
     for (int i = threadIdx.x; i < block; i += blockDim.x) yr[i] = post != nullptr ? s[i] * c * post[k0 + i] : s[i] * c;
 }
 
-// One row, one CTA per block of B entries (256-4096), THREADS threads each holding B / THREADS entries: stages h < 32
-// by shuffles, the next ones up to h = 512 by shuffles again after a transpose in shared memory (rows padded against
-// bank conflicts), the rest in registers. Each thread rewrites only the cells it read, so the transpose back needs no
-// barrier before it. GATHER: x[idx[k]] in place of x[k] (and no post).
+// One row, one CTA per block of B entries (256-4096): tq::rht_row_stages, then y = post * c * H_B(...). GATHER: x[idx[k]]
+// in place of x[k] (and no post).
 template <int B, int THREADS, bool GATHER>
 __device__ __forceinline__ void rht_row(const float* x, const int32_t* idx, float* y, float c, const float* pre,
                                         const float* post, int base) {
-    static_assert(B % THREADS == 0 && THREADS % 32 == 0 && THREADS <= 1024, "a CTA of whole warps covers the block");
-    constexpr int VALUES = B / THREADS;
-    constexpr int COL = B < 1024 ? B / 32 : 32;
     __shared__ float tile[B / 32][33];
+    tq::rht_row_stages<B, THREADS>(x, GATHER ? idx : nullptr, pre, base, tile);
     const int tid = threadIdx.x, lane = tid % 32;
 #pragma unroll
-    for (int i = 0; i < VALUES; ++i) {
-        const int k = tid + i * THREADS;
-        float v = x[GATHER ? idx[base + k] : base + k];
-        if (pre) v *= pre[base + k];
-#pragma unroll
-        for (int h = 1; h < 32; h *= 2) {
-            const float other = __shfl_xor_sync(0xffffffff, v, h);
-            v = (lane & h) ? other - v : v + other;
-        }
-        tile[k / 32][lane] = v;
-    }
-    __syncthreads();
-    float v[VALUES];
-#pragma unroll
-    for (int i = 0; i < VALUES; ++i) {
-        const int t = tid + i * THREADS;
-        v[i] = tile[t / (32 * COL) * COL + t % COL][t / COL % 32];
-#pragma unroll
-        for (int h = 1; h < COL; h *= 2) {
-            const float other = __shfl_xor_sync(0xffffffff, v[i], h);
-            v[i] = (lane & h) ? other - v[i] : v[i] + other;
-        }
-    }
-#pragma unroll
-    for (int step = 1024 / THREADS; step < VALUES; step *= 2) {
-#pragma unroll
-        for (int i = 0; i < VALUES; ++i) {
-            if (!(i & step)) {
-                const float a = v[i], b = v[i + step];
-                v[i] = a + b;
-                v[i + step] = a - b;
-            }
-        }
-    }
-#pragma unroll
-    for (int i = 0; i < VALUES; ++i) {
-        const int t = tid + i * THREADS;
-        tile[t / (32 * COL) * COL + t % COL][t / COL % 32] = v[i];
-    }
-    __syncthreads();
-#pragma unroll
-    for (int i = 0; i < VALUES; ++i) {
+    for (int i = 0; i < B / THREADS; ++i) {
         const int k = tid + i * THREADS;
         const float z = tile[k / 32][lane] * c;
         y[base + k] = !GATHER && post ? z * post[base + k] : z;

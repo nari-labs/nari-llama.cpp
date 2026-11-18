@@ -102,6 +102,13 @@ int tq_gemv(const tq_matrix* m, const void* x, tq_dtype x_type, int64_t x_stride
 // ms: n matrices with the same K. out_strides, pre, post, flags: arrays of n, or null (N, none, none, 0). ws:
 // tq_gemv_group_workspace_bytes(n, ms, rows) bytes, as for tq_gemv (one workspace serves tq_gemv and tq_gemv_group
 // calls alike); at most 2,097,152 outputs in all.
+// tq_gemv of one row whose input side is blockwise and needs no 128-point fusion: x_rot = H_b(pre * x[idx]) / sqrt(b)
+// on each run of `block` entries (256-4096; idx: K int32 indices into x, or null for x itself), then out = W^ x_rot
+// as tq_gemv with flags & TQ_HAD128_OUT and post. The same bits as tq_rht_gather (or tq_rht) followed by tq_gemv, in
+// one launch fewer and without x_rot in memory. x: fp32; out: N entries; ws: tq_gemv_workspace_bytes(K, N, 1).
+int tq_gemv_rht(const tq_matrix* m, const float* x, const int32_t* idx, int block, const float* pre, void* out,
+                tq_dtype out_type, const float* post, int flags, void* ws, size_t ws_bytes, void* stream);
+
 size_t tq_gemv_group_workspace_bytes(int n, const tq_matrix* ms, int rows);
 int tq_gemv_group(int n, const tq_matrix* ms, const void* x, tq_dtype x_type, int64_t x_stride, int rows,
                   void* const* outs, tq_dtype out_type, const int64_t* out_strides, const float* const* pre,

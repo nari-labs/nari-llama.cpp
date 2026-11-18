@@ -113,6 +113,7 @@ static void trellis_out(const trellis_op & o, float * y, float * dst, cudaStream
 
 static void trellis_product(ggml_backend_cuda_context & ctx, const trellis_op & o, const float * xin, int64_t xs,
                             const float * gpre, int flags, float * dst);
+static void trellis_product_rht(ggml_backend_cuda_context & ctx, const trellis_op & o, float * dst);
 
 void ggml_cuda_op_trellis(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const trellis_op o(dst);
@@ -121,18 +122,21 @@ void ggml_cuda_op_trellis(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     cudaStream_t stream = ctx.stream();
     const float * a = (const float *) o.pre->data;
 
+    // one column with a blockwise input side: the gather, pre and the side in the GEMV's activation launch
+    if (T == 1 && o.cols_kind == 1 && o.cols_block >= 256 && o.cols_block <= 4096) {
+        trellis_product_rht(ctx, o, (float *) dst->data);
+        return;
+    }
+
     // input: gather, then the side unless it fuses into the GEMV
     const float * xin = (const float *) o.x->data;
     int64_t xs = o.x->nb[1] / sizeof(float);
     const bool in_sep = (o.cols_kind == 1 && !o.in_fused()) || o.cols_kind == 2;
-    // one column: the gather, pre and a blockwise side in one kernel
-    const bool gather_rht = o.pin != nullptr && T == 1 && o.cols_kind == 1 && o.cols_block >= 256 &&
-                            o.cols_block <= 4096;
     ggml_cuda_pool_alloc<float> xbuf(ctx.pool());
     if (o.pin != nullptr || in_sep) {
         xbuf.alloc((size_t) K * T);
     }
-    if (o.pin != nullptr && !gather_rht) {
+    if (o.pin != nullptr) {
         trellis_gather_launch(xin, xs, (const int32_t *) o.pin->data, xbuf.ptr, K, K, T, stream);
         xin = xbuf.ptr, xs = K;
     }
@@ -140,9 +144,6 @@ void ggml_cuda_op_trellis(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const float * gpre = nullptr;
     if (o.in_fused()) {
         flags |= TQ_HAD128_IN, gpre = a;
-    } else if (gather_rht) {
-        TRELLIS_CHECK(tq_rht_gather(xin, (const int32_t *) o.pin->data, xbuf.ptr, K, o.cols_block, a, stream));
-        xin = xbuf.ptr, xs = K;
     } else if (o.cols_kind == 1) {
         TRELLIS_CHECK(tq_rht(xin, xs, xbuf.ptr, K, (int) T, K, o.cols_block, a, nullptr, stream));
         xin = xbuf.ptr, xs = K;
@@ -187,6 +188,27 @@ static void trellis_product(ggml_backend_cuda_context & ctx, const trellis_op & 
         TRELLIS_CHECK(tq_gemm(&m, xin, TQ_F32, xs, (int) T, y, TQ_F32, N, gpre, gpost, flags, ws, wsb,
                               ctx.cublas_handle(), stream));
     }
+    trellis_out(o, y, dst, stream);
+}
+
+// one column whose input side is a blockwise Hadamard of 256-4096 entries (with its input gather, if any): tq_gemv_rht,
+// then the output side and gather as trellis_product
+static void trellis_product_rht(ggml_backend_cuda_context & ctx, const trellis_op & o, float * dst) {
+    cudaStream_t stream = ctx.stream();
+    const tq_matrix m = o.matrix();
+    float * y = dst;
+    ggml_cuda_pool_alloc<float> ybuf(ctx.pool());
+    if (o.pout != nullptr) {
+        ybuf.alloc((size_t) o.N);
+        y = ybuf.ptr;
+    }
+    const int flags = o.out_fused() ? TQ_HAD128_OUT : 0;
+    const size_t wsb = tq_gemv_workspace_bytes(o.K, o.N, 1);
+    ggml_cuda_pool_alloc<char> wbuf(ctx.pool(), wsb + 256);
+    char * ws = trellis_align256(wbuf.ptr);
+    TRELLIS_CHECK(tq_gemv_rht(&m, (const float *) o.x->data, o.pin != nullptr ? (const int32_t *) o.pin->data : nullptr,
+                              o.cols_block, (const float *) o.pre->data, y, TQ_F32, o.gemv_post(), flags, ws, wsb,
+                              stream));
     trellis_out(o, y, dst, stream);
 }
 

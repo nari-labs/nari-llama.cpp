@@ -11073,6 +11073,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_trellis(type,  512, 256, t, {1,  128, 1}, {1, 128, 1}, {0, 0}, gather));
                 test_cases.emplace_back(new test_trellis(type, 1280, 768, t, {2,    0, 1}, {2,   0, 1}, {0, 0}, gather));
             }
+            // one column with a 2048-point input side, as a delta-net layer's out_proj
+            test_cases.emplace_back(new test_trellis(type, 4096, 256, 1, {1, 128, 1}, {1, 2048, 1}, {0, 0}, gather));
             for (int64_t t : {1, 65}) {
                 test_cases.emplace_back(new test_trellis(type,  512,  48, t, {0,    0, 1}, {1, 128, 1}, {0, 0}, gather));
                 test_cases.emplace_back(new test_trellis(type,  512, 512, t, {1,  256, 1}, {1, 512, 1}, {0, 0}, gather));

@@ -209,6 +209,61 @@ __device__ __forceinline__ void hadamard128(float (&v)[4], int lane) {
     v[0] = a + c, v[1] = b + d, v[2] = a - c, v[3] = b - d;                          // h = 64
 }
 
+// The butterflies of one row's block of B entries (256-4096) by a CTA of THREADS threads, each holding B / THREADS
+// entries: stages h < 32 by shuffles, the next ones up to h = 512 by shuffles again after a transpose in shared memory
+// (rows padded against bank conflicts), the rest in registers; each thread rewrites only the cells it read, so the
+// transpose back needs no barrier before it. Reads pre * x[base + k] (x[idx[base + k]] with idx) and leaves the
+// unnormalised H_B of it in tile: entry k at tile[k / 32][k % 32], every thread past the final barrier.
+template <int B, int THREADS>
+__device__ __forceinline__ void rht_row_stages(const float* x, const int32_t* idx, const float* pre, int base,
+                                               float (&tile)[B / 32][33]) {
+    static_assert(B % THREADS == 0 && THREADS % 32 == 0 && THREADS <= 1024, "a CTA of whole warps covers the block");
+    constexpr int VALUES = B / THREADS;
+    constexpr int COL = B < 1024 ? B / 32 : 32;
+    const int tid = threadIdx.x, lane = tid % 32;
+#pragma unroll
+    for (int i = 0; i < VALUES; ++i) {
+        const int k = tid + i * THREADS;
+        float v = x[idx != nullptr ? idx[base + k] : base + k];
+        if (pre) v *= pre[base + k];
+#pragma unroll
+        for (int h = 1; h < 32; h *= 2) {
+            const float other = __shfl_xor_sync(0xffffffff, v, h);
+            v = (lane & h) ? other - v : v + other;
+        }
+        tile[k / 32][lane] = v;
+    }
+    __syncthreads();
+    float v[VALUES];
+#pragma unroll
+    for (int i = 0; i < VALUES; ++i) {
+        const int t = tid + i * THREADS;
+        v[i] = tile[t / (32 * COL) * COL + t % COL][t / COL % 32];
+#pragma unroll
+        for (int h = 1; h < COL; h *= 2) {
+            const float other = __shfl_xor_sync(0xffffffff, v[i], h);
+            v[i] = (lane & h) ? other - v[i] : v[i] + other;
+        }
+    }
+#pragma unroll
+    for (int step = 1024 / THREADS; step < VALUES; step *= 2) {
+#pragma unroll
+        for (int i = 0; i < VALUES; ++i) {
+            if (!(i & step)) {
+                const float a = v[i], b = v[i + step];
+                v[i] = a + b;
+                v[i + step] = a - b;
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < VALUES; ++i) {
+        const int t = tid + i * THREADS;
+        tile[t / (32 * COL) * COL + t % COL][t / COL % 32] = v[i];
+    }
+    __syncthreads();
+}
+
 // The position of input k (0-15) of a 16-input tile within a token's 16 halves in the m16n8k16 B fragment order:
 // words (2q, 2q + 1) of token g hold inputs (2q, 2q + 1) and (2q + 8, 2q + 9), so that lane 4 g + q loads b0, b1 as
 // one 8-byte pair.
