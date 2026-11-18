@@ -1205,10 +1205,9 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
         ggml_set_name(probe, tensor->name);
         return select_weight_buft(hparams, probe, op, buft_list);
     }
-    // trellis fork: an I32 tensor of a matmul's layer is an index vector (a coded weight's input or output gather, a
-    // banded lm_head's vocab_gather), read as by get_rows: placing it by MUL_MAT support would put it in host memory and
-    // split the graph at every coded linear that reads it
-    if (tensor->type == GGML_TYPE_I32 && op == GGML_OP_MUL_MAT) {
+    // trellis fork: a banded lm_head's output.vocab_gather is an index vector read by get_rows: placing it by MUL_MAT
+    // support would put it in host memory and split the graph after the logits (the sides took the branch above)
+    if (tensor->type == GGML_TYPE_I32 && op == GGML_OP_MUL_MAT && strcmp(tensor->name, "output.vocab_gather") == 0) {
         op = GGML_OP_GET_ROWS;
     }
     // trellis fork: a coded weight is only ever read by its own ops (no backend runs a plain MUL_MAT or GET_ROWS on
