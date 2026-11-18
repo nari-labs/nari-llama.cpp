@@ -380,6 +380,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_solve_tri(ctx, idx);
             } break;
+        case GGML_OP_TRELLIS:
+            {
+                n_fuse = ggml_metal_op_trellis(ctx, idx);
+            } break;
         case GGML_OP_MUL_MAT:
             {
                 n_fuse = ggml_metal_op_mul_mat(ctx, idx);
@@ -6352,5 +6356,156 @@ int ggml_metal_op_count_equal(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
     }
 
+    return 1;
+}
+
+bool ggml_metal_op_trellis_supported(const ggml_tensor * op) {
+    const ggml_tensor * w = op->src[0];
+    const ggml_tensor * x = op->src[1];
+    const int32_t * d = (const int32_t *) op->op_params;
+    if (!w || !x || !ggml_is_trellis_type(w->type) || !ggml_is_matrix(w) ||
+            x->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) || x->ne[0] != w->ne[0] ||
+            op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op) ||
+            w->ne[0] > INT32_MAX/2 || w->ne[1] > INT32_MAX/2 || ggml_nrows(x) > INT32_MAX ||
+            d[6] < 0 || d[6] > 8 || !ggml_trellis_desc_supported(w->ne[0], w->ne[1], d, 7 + d[6])) {
+        return false;
+    }
+    const ggml_type types[] = {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I32, GGML_TYPE_I32};
+    const int64_t sizes[] = {w->ne[0]/16, w->ne[0], w->ne[1], w->ne[0], w->ne[1]};
+    for (int i = 0; i < 5; ++i) {
+        const ggml_tensor * t = op->src[i + 2];
+        if (!t) {
+            if (i < 3) { return false; }
+            continue;
+        }
+        if (t->type != types[i] || !ggml_is_contiguous(t) || ggml_nelements(t) != sizes[i]) {
+            return false;
+        }
+    }
+    return ggml_is_contiguous(w);
+}
+
+size_t ggml_metal_op_trellis_extra(const ggml_tensor * op) {
+    const size_t batch = std::min<int64_t>(ggml_nrows(op->src[1]), GGML_METAL_TRELLIS_BATCH);
+    return 2*batch*(op->src[0]->ne[0] + op->src[0]->ne[1])*sizeof(float);
+}
+
+static void ggml_metal_trellis_pipeline(ggml_metal_op_t ctx, const char * name) {
+    auto p = ggml_metal_library_get_pipeline(ctx->lib, name);
+    if (!p.pipeline) {
+        p = ggml_metal_library_compile_pipeline(ctx->lib, name, name, nullptr);
+    }
+    ggml_metal_encoder_set_pipeline(ctx->enc, p);
+}
+
+static void ggml_metal_trellis_side(ggml_metal_op_t ctx, ggml_metal_buffer_id & data,
+        ggml_metal_buffer_id & tmp, int n, int batch, int kind, int block, int shards,
+        const int32_t * parts, int nparts, bool inverse) {
+    if (kind == 0) { return; }
+    ggml_metal_kargs_trellis_side a = {};
+    a.n = n;
+    a.len = kind == 1 ? block : n/shards;
+    a.shards = kind == 1 ? n/block : shards;
+    a.m = kind == 1 ? 1 : ggml_trellis_hadfull_m(a.len);
+    a.run = a.len/a.m;
+    a.inverse = inverse;
+    a.nparts = kind == 2 ? nparts : 0;
+    for (int i = 0; i < a.nparts; ++i) { a.parts[i] = parts[i]; }
+    if (kind == 1 && block <= 4096) {
+        a.scale = float(std::pow(double(block), -0.5));
+        ggml_metal_trellis_pipeline(ctx, "kernel_trellis_block");
+        ggml_metal_encoder_set_bytes(ctx->enc, &a, sizeof(a), 0);
+        ggml_metal_encoder_set_buffer(ctx->enc, data, 1);
+        ggml_metal_encoder_set_threadgroup_memory_size(ctx->enc, block*sizeof(float), 0);
+        ggml_metal_encoder_dispatch_threadgroups(ctx->enc, n/block, batch, 1, std::min(block/2, 256), 1, 1);
+        ggml_metal_encoder_memory_barrier(ctx->enc);
+        return;
+    }
+    auto cross = [&]() {
+        if (a.m == 1) { return; }
+        a.scale = float(std::pow(double(a.m), -0.5));
+        ggml_metal_trellis_pipeline(ctx, "kernel_trellis_cross");
+        ggml_metal_encoder_set_bytes(ctx->enc, &a, sizeof(a), 0);
+        ggml_metal_encoder_set_buffer(ctx->enc, data, 1);
+        ggml_metal_encoder_set_buffer(ctx->enc, tmp, 2);
+        ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (a.len + 255)/256, a.shards, batch, 256, 1, 1);
+        ggml_metal_encoder_memory_barrier(ctx->enc);
+        std::swap(data, tmp);
+    };
+    if (inverse) { cross(); }
+    for (a.h = 1; a.h < a.run; a.h *= 2) {
+        a.scale = a.h == a.run/2 ? float(std::pow(double(a.run), -0.5)) : 1.0f;
+        ggml_metal_trellis_pipeline(ctx, "kernel_trellis_butterfly");
+        ggml_metal_encoder_set_bytes(ctx->enc, &a, sizeof(a), 0);
+        ggml_metal_encoder_set_buffer(ctx->enc, data, 1);
+        ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (a.len/2 + 255)/256, a.shards, batch, 256, 1, 1);
+        ggml_metal_encoder_memory_barrier(ctx->enc);
+    }
+    if (!inverse) { cross(); }
+}
+
+int ggml_metal_op_trellis(ggml_metal_op_t ctx, int idx) {
+    const ggml_tensor * op = ctx->node(idx);
+    GGML_ASSERT(ggml_metal_op_trellis_supported(op));
+    const ggml_tensor * w = op->src[0];
+    const ggml_tensor * x = op->src[1];
+    const int32_t * d = (const int32_t *) op->op_params;
+    ggml_metal_kargs_trellis a = {};
+    a.K = w->ne[0];
+    a.N = w->ne[1];
+    a.bits = w->type - GGML_TYPE_TRL1 + 1;
+    a.pin = op->src[5] != nullptr;
+    a.pout = op->src[6] != nullptr;
+    a.ne1 = x->ne[1]; a.ne2 = x->ne[2];
+    a.nb1 = x->nb[1]; a.nb2 = x->nb[2]; a.nb3 = x->nb[3];
+    const int64_t tokens = ggml_nrows(x);
+    const size_t capacity = std::min<int64_t>(tokens, GGML_METAL_TRELLIS_BATCH);
+    const auto dst = ggml_metal_get_buffer_id(op);
+    auto scratch = dst;
+    scratch.offs += ggml_nbytes(op);
+    // Two activation buffers per side, reused for every token chunk. No dense weights.
+    for (int64_t first = 0; first < tokens; first += GGML_METAL_TRELLIS_BATCH) {
+        const int batch = std::min<int64_t>(tokens - first, GGML_METAL_TRELLIS_BATCH);
+        a.first = first;
+        a.batch = batch;
+        auto in = scratch, in_tmp = scratch, out = scratch, out_tmp = scratch;
+        in_tmp.offs += capacity*a.K*sizeof(float);
+        out.offs += 2*capacity*a.K*sizeof(float);
+        out_tmp.offs = out.offs + capacity*a.N*sizeof(float);
+        ggml_metal_trellis_pipeline(ctx, "kernel_trellis_input");
+        ggml_metal_encoder_set_bytes(ctx->enc, &a, sizeof(a), 0);
+        ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(x), 1);
+        ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(op->src[3]), 2);
+        ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(op->src[5]), 3);
+        ggml_metal_encoder_set_buffer(ctx->enc, in, 4);
+        ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (a.K + 255)/256, batch, 1, 256, 1, 1);
+        ggml_metal_encoder_memory_barrier(ctx->enc);
+        ggml_metal_trellis_side(ctx, in, in_tmp, a.K, batch, d[3], d[4], d[5], nullptr, 0, false);
+        const int columns = batch == 1 ? 1 : 4;
+        char name[64];
+        const bool use_mm = batch >= 7 && ggml_metal_device_get_props(ctx->dev)->has_simdgroup_mm;
+        const bool use_mv = batch == 1 && a.N >= 256;
+        if (use_mm) { snprintf(name, sizeof(name), "kernel_trellis_product_mm_%d", a.bits); }
+        else if (use_mv) { snprintf(name, sizeof(name), "kernel_trellis_product_mv_%d", a.bits); }
+        else { snprintf(name, sizeof(name), "kernel_trellis_product_%d_%d", a.bits, columns); }
+        ggml_metal_trellis_pipeline(ctx, name);
+        ggml_metal_encoder_set_bytes(ctx->enc, &a, sizeof(a), 0);
+        ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(w), 1);
+        ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(op->src[2]), 2);
+        ggml_metal_encoder_set_buffer(ctx->enc, in, 3);
+        ggml_metal_encoder_set_buffer(ctx->enc, out, 4);
+        ggml_metal_encoder_dispatch_threadgroups(ctx->enc, use_mm || use_mv ? a.N/16 : a.N/4,
+                use_mm ? (batch + 15)/16 : (batch + columns - 1)/columns, 1, 32, 4, 1);
+        ggml_metal_encoder_memory_barrier(ctx->enc);
+        ggml_metal_trellis_side(ctx, out, out_tmp, a.N, batch, d[0], d[1], d[2], d + 7, d[6], true);
+        ggml_metal_trellis_pipeline(ctx, "kernel_trellis_output");
+        ggml_metal_encoder_set_bytes(ctx->enc, &a, sizeof(a), 0);
+        ggml_metal_encoder_set_buffer(ctx->enc, out, 1);
+        ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(op->src[4]), 2);
+        ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(op->src[6]), 3);
+        ggml_metal_encoder_set_buffer(ctx->enc, dst, 4);
+        ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (a.N + 255)/256, batch, 1, 256, 1, 1);
+        ggml_metal_encoder_memory_barrier(ctx->enc);
+    }
     return 1;
 }

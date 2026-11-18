@@ -2,6 +2,17 @@
 
 List of GGML operations and backend support status.
 
+## NariQ fork operations
+
+`test-trellis` separately checks the fork's coded operations; pass `MTL0` to test native Metal buffers and mixed CPU/GPU execution. These operations are not included in the upstream-generated table below.
+
+| Operation | CPU | CUDA | Metal |
+| --- | --- | --- | --- |
+| `TRELLIS` | TRL1-6 | TRL1-6 on compute capability 8.0+ | TRL1-6 with FP32 activations, contiguous elements, supported descriptors and SIMD-group reductions |
+| `TRELLIS_GET_ROWS` | Ordinary and banded coded embeddings | CPU fallback | CPU fallback |
+
+See [the Metal guide](../nariq/README-metal.md) for numerical coverage, temporary memory bounds and qualification limits. Other backends use CPU fallback for these operations.
+
 ## How to add a backend to this table:
 
 1. Run `test-backend-ops support --output csv` with your backend name and redirect output to a csv file in `docs/ops/` (e.g., `docs/ops/CUDA.csv`)

@@ -72,6 +72,7 @@ set(METALLIB_KERNEL_SOURCES
     kernels/upscale.metal
     kernels/argsort.metal
     kernels/pool.metal
+    kernels/trellis.metal
     kernels/misc.metal
 )
 

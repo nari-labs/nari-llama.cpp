@@ -1,9 +1,14 @@
-name: NariQ CPU checks
+name: NariQ CPU and Metal checks
 on:
   pull_request:
   push:
     branches: [master]
   workflow_dispatch:
+    inputs:
+      metal_gpu:
+        description: Run correctness tests on a self-hosted Apple Silicon Metal runner
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -42,3 +47,27 @@ jobs:
           python -m unittest discover -s nariq/tests -v
       - name: Server starts without a model
         run: build/bin/llama-server --version
+
+  metal-build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure compiled Metal library
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=OFF -DGGML_NATIVE=OFF -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_EXAMPLES=OFF
+      - name: Build Metal shaders and numerical harness
+        run: cmake --build build -j 3 --target ggml-metal-lib test-trellis
+      - name: Check portable CPU reference
+        run: ctest --test-dir build --output-on-failure -R '^test-trellis$'
+  metal-gpu:
+    if: github.event_name == 'workflow_dispatch' && inputs.metal_gpu
+    runs-on: [self-hosted, macOS, ARM64, metal]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure Metal backend
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_EXAMPLES=OFF
+      - name: Build numerical harness
+        run: cmake --build build -j 3 --target test-trellis
+      - name: Check native GPU and CPU fallback
+        run: ctest --test-dir build --output-on-failure -R '^test-trellis-metal(-private)?$'
+        env:
+          MTL_SHADER_VALIDATION: '1'

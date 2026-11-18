@@ -31,6 +31,10 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
 // available ops:
 //
 
+bool ggml_metal_op_trellis_supported(const struct ggml_tensor * op);
+size_t ggml_metal_op_trellis_extra(const struct ggml_tensor * op);
+int ggml_metal_op_trellis(ggml_metal_op_t ctx, int idx);
+
 // tokens per expert
 size_t ggml_metal_op_mul_mat_id_extra_tpe(const struct ggml_tensor * op);
 

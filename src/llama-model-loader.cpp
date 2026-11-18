@@ -1419,13 +1419,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
             }
-            // trellis fork: say once per load when a GPU cannot run the coded linears (libtrellis needs sm_80 or newer); the
+            // trellis fork: say once per load when a backend/device cannot run the coded linears; the
             // coded embedding always stays in host memory, so it does not count
             ggml_backend_dev_t gpu = buft_list->front().first;
             if (op == GGML_OP_MUL_MAT && ggml_is_trellis_type(t_meta->type) && !trellis_gpu_warned && gpu != nullptr &&
                     ggml_backend_dev_type(gpu) == GGML_BACKEND_DEVICE_TYPE_GPU && ggml_backend_buft_get_device(buft) != gpu) {
                 trellis_gpu_warned = true;
-                LLAMA_LOG_WARN("trellis: %s (%s) cannot run the coded linears, which need an NVIDIA GPU of compute capability 8.0 or newer; they run on the CPU, which is much slower\n",
+                LLAMA_LOG_WARN("trellis: %s (%s) cannot run the coded linears, on this backend/device; they run on the CPU, which is much slower\n",
                         ggml_backend_dev_name(gpu), ggml_backend_dev_description(gpu));
             }
         }
