@@ -35,6 +35,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <random>
 #include <regex>
 #include <set>
@@ -2667,6 +2668,204 @@ struct test_mul_mat_reorder_then_big_batch : public test_case {
         // mm1 is the first source of the final ADD, so the reorder-installing
         // small-batch mul_mat is computed before the big-batch one
         return ggml_add(ctx, ggml_repeat(ctx, mm1, mm2), mm2);
+    }
+};
+
+// a trellis side: kind 0 (none), 1 (blockwise Hadamard of block) or 2 (whole-slice Hadamard in shards slices)
+using trellis_side = std::array<int32_t, 3>;
+
+static std::vector<int32_t> trellis_desc(const trellis_side & rows, const trellis_side & cols, const std::vector<int32_t> & parts) {
+    std::vector<int32_t> desc = { rows[0], rows[1], rows[2], cols[0], cols[1], cols[2], (int32_t) parts.size() };
+    desc.insert(desc.end(), parts.begin(), parts.end());
+    return desc;
+}
+
+// fills the inputs of the trellis tests from a fixed seed: any bytes are valid codes, I32 tensors are gathers and get
+// a permutation, except "ids" (tokens in [0, n_ids_max))
+static void init_trellis_tensors(ggml_context * ctx, uint32_t seed, int64_t n_ids_max) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (ggml_is_view_op(t->op) || t->view_src != nullptr) {
+            continue;
+        }
+        const int64_t n = ggml_nelements(t);
+        if (ggml_is_trellis_type(t->type)) {
+            std::vector<uint8_t> codes(ggml_nbytes(t));
+            for (auto & c : codes) {
+                c = (uint8_t) rng();
+            }
+            ggml_backend_tensor_set(t, codes.data(), 0, codes.size());
+        } else if (t->type == GGML_TYPE_I32) {
+            std::vector<int32_t> idx(n);
+            if (strcmp(t->name, "ids") == 0) {
+                for (auto & i : idx) {
+                    i = (int32_t) (rng() % n_ids_max);
+                }
+            } else {
+                std::iota(idx.begin(), idx.end(), 0);
+                std::shuffle(idx.begin(), idx.end(), rng);
+            }
+            ggml_backend_tensor_set(t, idx.data(), 0, n * sizeof(int32_t));
+        } else if (t->type == GGML_TYPE_F16) {
+            // block scales: the codes are integers in [-126, 126]
+            std::vector<ggml_fp16_t> s(n);
+            for (auto & v : s) {
+                v = ggml_fp32_to_fp16(0.01f + 0.005f * uni(rng));
+            }
+            ggml_backend_tensor_set(t, s.data(), 0, n * sizeof(ggml_fp16_t));
+        } else if (t->type == GGML_TYPE_F32) {
+            std::vector<float> v(n);
+            for (auto & x : v) {
+                x = uni(rng);
+            }
+            ggml_backend_tensor_set(t, v.data(), 0, n * sizeof(float));
+        }
+    }
+}
+
+// GGML_OP_TRELLIS
+struct test_trellis : public test_case {
+    const ggml_type type;
+    const int64_t k; // inputs
+    const int64_t n; // outputs
+    const int64_t t; // tokens
+    const trellis_side rows;
+    const trellis_side cols;
+    const std::array<int32_t, 2> parts; // the fused parts of the outputs (0: none), for a whole-slice output side
+    const bool gather; // input and output gathers
+
+    std::string vars() override {
+        return VARS_TO_STR8(type, k, n, t, rows, cols, parts, gather);
+    }
+
+    // the CUDA kernels round the activations to FP16, with one scale per 128 inputs
+    double max_nmse_err() override {
+        return 1e-5;
+    }
+
+    test_trellis(ggml_type type, int64_t k, int64_t n, int64_t t, trellis_side rows, trellis_side cols,
+            std::array<int32_t, 2> parts = {0, 0}, bool gather = false)
+        : type(type), k(k), n(n), t(t), rows(rows), cols(cols), parts(parts), gather(gather) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w    = ggml_new_tensor_2d(ctx, type, k, n);
+        ggml_tensor * x    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, t);
+        ggml_tensor * s16  = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, k / 16);
+        ggml_tensor * pre  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+        ggml_tensor * post = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ggml_tensor * pin  = gather ? ggml_new_tensor_1d(ctx, GGML_TYPE_I32, k) : nullptr;
+        ggml_tensor * pout = gather ? ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n) : nullptr;
+        ggml_set_name(w, "w");
+        ggml_set_name(x, "x");
+
+        std::vector<int32_t> p = { (int32_t) n };
+        if (parts[0] > 0) {
+            p = { parts[0], parts[1] };
+        }
+        const std::vector<int32_t> desc = trellis_desc(rows, cols, p);
+        ggml_tensor * out = ggml_trellis_mul_mat(ctx, w, x, s16, pre, post, pin, pout, desc.data(), (int) desc.size());
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_trellis_tensors(ctx, 1234, 0);
+    }
+};
+
+// GGML_OP_TRELLIS twice on one input, a swiglu and a third GGML_OP_TRELLIS: the pattern of a coded MLP, which a backend
+// may run as an input group and a fused chain
+struct test_trellis_mlp : public test_case {
+    const ggml_type type;
+    const int64_t n_embd;
+    const int64_t n_ff;
+    const int64_t t;
+    const int32_t block; // the Hadamard block between up/gate and down
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, n_embd, n_ff, t, block);
+    }
+
+    double max_nmse_err() override {
+        return 1e-5;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_trellis_mlp(ggml_type type, int64_t n_embd, int64_t n_ff, int64_t t, int32_t block)
+        : type(type), n_embd(n_embd), n_ff(n_ff), t(t), block(block) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, t);
+        ggml_set_name(x, "x");
+
+        auto linear = [&](ggml_tensor * inp, int64_t k, int64_t n, const trellis_side & rows, const trellis_side & cols) {
+            ggml_tensor * w    = ggml_new_tensor_2d(ctx, type, k, n);
+            ggml_tensor * s16  = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, k / 16);
+            ggml_tensor * pre  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+            ggml_tensor * post = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+            const std::vector<int32_t> desc = trellis_desc(rows, cols, { (int32_t) n });
+            return ggml_trellis_mul_mat(ctx, w, inp, s16, pre, post, nullptr, nullptr, desc.data(), (int) desc.size());
+        };
+        ggml_tensor * gate = linear(x, n_embd, n_ff, {1, block, 1}, {1, 128, 1});
+        ggml_tensor * up   = linear(x, n_embd, n_ff, {1, block, 1}, {1, 128, 1});
+        ggml_tensor * glu  = ggml_swiglu_split(ctx, gate, up);
+        ggml_tensor * out  = linear(glu, n_ff, n_embd, {1, 128, 1}, {1, block, 1});
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_trellis_tensors(ctx, 4321, 0);
+    }
+};
+
+// GGML_OP_TRELLIS_GET_ROWS: rows of a coded embedding; banded, the rows are split into two bands that each write
+// their own rows in place through a vocabulary gather (ggml_trellis_get_rows_band)
+struct test_trellis_get_rows : public test_case {
+    const ggml_type type;
+    const int64_t k; // row length
+    const int64_t n; // rows
+    const int64_t r; // rows to get
+    const trellis_side cols;
+    const bool banded;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, k, n, r, cols, banded);
+    }
+
+    test_trellis_get_rows(ggml_type type, int64_t k, int64_t n, int64_t r, trellis_side cols, bool banded)
+        : type(type), k(k), n(n), r(r), cols(cols), banded(banded) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, r);
+        ggml_set_name(ids, "ids");
+
+        const std::vector<int64_t> band_rows = banded ? std::vector<int64_t>{ n / 2, n - n / 2 } : std::vector<int64_t>{ n };
+        ggml_tensor * gather = banded ? ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n) : nullptr;
+        // the chain writes in place, so it starts from an initialized tensor
+        ggml_tensor * out = banded ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, r) : nullptr;
+        int64_t row0 = 0;
+        for (int64_t nb : band_rows) {
+            ggml_tensor * w    = ggml_new_tensor_2d(ctx, type, k, nb);
+            ggml_tensor * s16  = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, k / 16);
+            ggml_tensor * pre  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+            ggml_tensor * post = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nb);
+            const std::vector<int32_t> desc = trellis_desc({0, 0, 1}, cols, { (int32_t) nb });
+            out = banded ? ggml_trellis_get_rows_band(ctx, out, w, ids, gather, row0, s16, pre, post, desc.data(), (int) desc.size())
+                         : ggml_trellis_get_rows(ctx, w, ids, s16, pre, post, desc.data(), (int) desc.size());
+            row0 += nb;
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_trellis_tensors(ctx, 5678, n);
     }
 };
 
@@ -10797,6 +10996,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 256, 8, 2, 1, 1, false, true, 3));
+
+    for (int bits = 1; bits <= 6; ++bits) {
+        const ggml_type type = (ggml_type) (GGML_TYPE_TRL1 + bits - 1);
+        for (bool gather : {false, true}) {
+            for (int64_t t : {1, 8, 65, 512}) {
+                test_cases.emplace_back(new test_trellis(type,  256, 256, t, {0,    0, 1}, {0,   0, 1}, {0, 0}, gather));
+                test_cases.emplace_back(new test_trellis(type,  512, 256, t, {1,  128, 1}, {1, 128, 1}, {0, 0}, gather));
+                test_cases.emplace_back(new test_trellis(type, 1280, 768, t, {2,    0, 1}, {2,   0, 1}, {0, 0}, gather));
+            }
+            for (int64_t t : {1, 65}) {
+                test_cases.emplace_back(new test_trellis(type,  512,  48, t, {0,    0, 1}, {1, 128, 1}, {0, 0}, gather));
+                test_cases.emplace_back(new test_trellis(type,  512, 512, t, {1,  256, 1}, {1, 512, 1}, {0, 0}, gather));
+                test_cases.emplace_back(new test_trellis(type, 1280, 768, t, {2,    0, 2}, {2,   0, 2}, {512, 256}, gather));
+            }
+        }
+        for (int64_t t : {1, 8, 65}) {
+            test_cases.emplace_back(new test_trellis_mlp(type, 512, 1024, t, 256));
+        }
+        for (const trellis_side & cols : std::vector<trellis_side>{ {0, 0, 1}, {1, 128, 1}, {2, 0, 1} }) {
+            const int64_t k = cols[0] == 2 ? 1280 : 256;
+            for (bool banded : {false, true}) {
+                test_cases.emplace_back(new test_trellis_get_rows(type, k, 96, 7, cols, banded));
+            }
+        }
+    }
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 70000, 4, 1, false)); // row count > CUDA grid-y limit (65535)
