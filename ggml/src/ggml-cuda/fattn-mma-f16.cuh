@@ -2247,12 +2247,13 @@ template <int DKQ, int DV, int ncols1, int ncols2>
 void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     // Single-token decode with 256-wide heads reads BF16 K/V directly instead of converting the whole cache per call.
-    // Measured on SM120 only, and for now enabled only in graphs with coded linears (GGML_OP_TRELLIS).
+    // Measured on SM90 and SM120 only, and for now enabled only in graphs with coded linears (GGML_OP_TRELLIS).
     if constexpr (DKQ == 256 && DV == 256 && ncols1 == 1 && ncols2 == 8) {
         const ggml_tensor * Q = dst->src[0];
         const ggml_tensor * K = dst->src[1];
         const ggml_tensor * V = dst->src[2];
-        if (ctx.graph_has_trellis_op && ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_BLACKWELL &&
+        const int cc = ggml_cuda_info().devices[ctx.device].cc;
+        if (ctx.graph_has_trellis_op && (cc == GGML_CUDA_CC_HOPPER || cc == GGML_CUDA_CC_BLACKWELL) &&
                 Q->ne[1] == 1 && K->type == GGML_TYPE_BF16 && V->type == GGML_TYPE_BF16) {
             ggml_cuda_flash_attn_ext_mma_f16_launch<DKQ, DV, ncols1, ncols2, true>(ctx, dst);
             return;
