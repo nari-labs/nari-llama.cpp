@@ -83,10 +83,9 @@ int tq_repack(const void* src, int64_t src_stride_k, int64_t src_stride_n, void*
 // Activations are rounded to fp16 with one power-of-two scale per (row, 128 inputs) (about 2^-12 relative error per
 // element); products accumulate in fp32 on tensor cores; split-K partials are summed in a fixed order, so the result
 // is deterministic for a given rows and device. Needs sm_80+ (mma.sync m16n8k16).
-// ws: tq_gemv_workspace_bytes(K, N, rows) bytes (256-byte aligned). Its first TQ_GEMV_COUNTER_BYTES hold the split
-// counters: zero them once (cudaMemset) before the first call; every call leaves them zero again, whatever its shape,
-// so one workspace of the largest size serves every module (calls that share it must be ordered: one stream). The
-// rest is scratch. N <= 2,097,152.
+// ws: tq_gemv_workspace_bytes(K, N, rows) bytes (256-byte aligned), uninitialized: each call zeroes the split
+// counters it uses (its first TQ_GEMV_COUNTER_BYTES) before its GEMV. One workspace of the largest size serves every
+// module, for calls ordered on one stream; concurrent calls need their own. N <= 2,097,152.
 // The 2-bit decode is the engine's version 6 (byte-permute windows) at 1-32 rows. TQ_DECODE_V4 selects version 4's
 // decode at 2 bits instead, for A/B timing only: the weights it decodes, and so the outputs, are the same.
 #define TQ_HAD128_OUT 1
@@ -101,10 +100,11 @@ int tq_gemv(const tq_matrix* m, const void* x, tq_dtype x_type, int64_t x_stride
 // tq_gemv for n <= 8 matrices that read the same x (an input group: attention's q/k/v, the MLP's gate/up, a DeltaNet
 // layer's in_proj_qkv/z/a/b): one launch prepares every member's activations from one read of x (each with its own
 // pre[i], flags[i] & TQ_HAD128_IN and block scales), then one GEMV launch per code width runs the members of that
-// width. Member i's output is byte-identical to tq_gemv(&ms[i], x, ..., outs[i], ..., pre[i], post[i], flags[i]).
+// width (one launch for all of them at one row). Member i's output is byte-identical to tq_gemv(&ms[i], x, ...,
+// outs[i], ..., pre[i], post[i], flags[i]).
 // ms: n matrices with the same K. out_strides, pre, post, flags: arrays of n, or null (N, none, none, 0). ws:
-// tq_gemv_group_workspace_bytes(n, ms, rows) bytes, its first TQ_GEMV_COUNTER_BYTES zeroed once, as for tq_gemv (one
-// workspace serves tq_gemv and tq_gemv_group calls alike); at most 2,097,152 outputs in all.
+// tq_gemv_group_workspace_bytes(n, ms, rows) bytes, as for tq_gemv (one workspace serves tq_gemv and tq_gemv_group
+// calls alike); at most 2,097,152 outputs in all.
 size_t tq_gemv_group_workspace_bytes(int n, const tq_matrix* ms, int rows);
 int tq_gemv_group(int n, const tq_matrix* ms, const void* x, tq_dtype x_type, int64_t x_stride, int rows,
                   void* const* outs, tq_dtype out_type, const int64_t* out_strides, const float* const* pre,
@@ -145,6 +145,10 @@ int tq_decode_host(const void* codes, int bits, int K, int N, int64_t tile_strid
 // one multiply by fp32(block^-0.5)).
 int tq_rht(const float* x, int64_t x_stride, float* y, int64_t y_stride, int rows, int n, int block, const float* pre,
            const float* post, void* stream);
+
+// tq_rht of one gathered row: y = H_b (pre * x[idx]) on each run of `block` entries (256-4096), the same bits as a
+// gather followed by tq_rht. idx: n int32 indices into x. y must not overlap x.
+int tq_rht_gather(const float* x, const int32_t* idx, float* y, int n, int block, const float* pre, void* stream);
 
 // A whole-slice side (trellis.hadfull): the n entries are `nparts` fused parts in stored order, each cut in `shards`
 // equal contiguous shards; slice r is shard r of every part, side by side (one slice of all n when shards = 1). Each

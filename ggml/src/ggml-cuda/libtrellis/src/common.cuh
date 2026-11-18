@@ -180,6 +180,9 @@ __device__ __forceinline__ void decode_exact(const uint32_t (&w)[2 * Plan<K>::AN
 __device__ __forceinline__ void cp16s(uint32_t smem, const void* gmem) {  // 16-byte global -> shared, L2 only
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(smem), "l"(gmem));
 }
+__device__ __forceinline__ void cp16s_l2_256(uint32_t smem, const void* gmem) {  // cp16s, prefetching 256 bytes into L2
+    asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], 16;" ::"r"(smem), "l"(gmem));
+}
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;"); }
 template <int N>
 __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N)); }
