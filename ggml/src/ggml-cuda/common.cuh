@@ -1393,6 +1393,9 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // the graph being computed has coded linears (GGML_OP_TRELLIS); some optimizations are enabled only for these graphs
+    bool graph_has_trellis_op = false;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
