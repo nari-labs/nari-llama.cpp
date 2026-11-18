@@ -420,13 +420,23 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     const int64_t conv_kernel_size = conv_kernel->ne[0];
     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
 
-    ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
-
-    // decode of the only sequence of a one-slot cache: the delta net reads the cached state in place instead of a
-    // gathered copy (can_reuse checks rs_z, so a reused graph keeps this choice valid)
+    // decode of the only sequence of a one-slot cache: the convolution and the delta net read their cached states in
+    // place instead of gathered copies (can_reuse checks rs_z, so a reused graph keeps this choice valid)
     // TODO: enabled for models with coded linears only until it is measured on others
     const bool state_in_place = !model.trellis.weights.empty() && n_seq_tokens == 1 && n_seqs == 1 &&
-        ssm_states_all->ne[1] == 1 && ssm_states_all->type == GGML_TYPE_F32 && mctx_cur->get_rs_z() < 0;
+        cparams.n_rs_seq == 0 && ssm_states_all->ne[1] == 1 && ssm_states_all->type == GGML_TYPE_F32 &&
+        mctx_cur->get_rs_z() < 0;
+
+    ggml_tensor * conv_input = nullptr;
+    if (state_in_place && conv_states_all->ne[1] == 1) {
+        ggml_tensor * conv_states = ggml_reshape_3d(ctx0, conv_states_all, conv_kernel_size - 1, conv_channels, 1);
+        conv_input = ggml_concat(ctx0, conv_states, ggml_transpose(ctx0, qkv_mixed), 0);
+        cb(conv_input, "conv_input", il);
+        build_conv_state_store(inp, conv_states_all, conv_input, conv_kernel_size - 1, 0);
+    } else {
+        conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+    }
+
     ggml_tensor * state = state_in_place ? ssm_states_all : build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
