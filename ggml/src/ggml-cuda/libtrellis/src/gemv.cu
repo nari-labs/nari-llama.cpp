@@ -276,6 +276,7 @@ __device__ __forceinline__ void gemv_body(const Args& a, int cb, int split) {
 
 template <int K, int RM, int D, bool SINGLE>
 __global__ void __launch_bounds__(32 * W4, (Occ<K, RM, SINGLE>::CTAS)) gemv_k(Args a) {
+    tq::launch_dependents();
     if constexpr (SINGLE) a.rows = 1;  // a constant row count folds the row-group loops
     gemv_body<K, RM, D, SINGLE>(a, blockIdx.x, blockIdx.y);
 }
@@ -292,6 +293,7 @@ struct Multi {
 // __grid_constant__: the members' arguments are read in place from parameter space, whatever the member index.
 template <int K, int RM, int D, bool SINGLE>
 __global__ void __launch_bounds__(32 * W4, (Occ<K, RM, SINGLE>::CTAS)) gemv_multi_k(const __grid_constant__ Multi g) {
+    tq::launch_dependents();
     int m = 0;
 #pragma unroll
     for (int i = 1; i < MAX_GROUP; ++i)
@@ -315,6 +317,7 @@ struct MixedGroup {
 };
 
 __global__ void __launch_bounds__(32 * W4, 4) gemv_mixed_k(const __grid_constant__ MixedGroup g) {
+    tq::launch_dependents();
     int member = 0;
     for (int i = 1; i < g.n; ++i) {
         if ((int)blockIdx.x >= g.first[i]) member = i;

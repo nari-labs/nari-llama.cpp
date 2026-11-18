@@ -185,6 +185,7 @@ struct RowsSet {
 
 template <int B, int THREADS>
 __global__ void rht_rows_k(const __grid_constant__ RowsSet set) {
+    tq::launch_dependents();
     int m = 0;
 #pragma unroll
     for (int i = 1; i < MAX_ROWS_SET; ++i)

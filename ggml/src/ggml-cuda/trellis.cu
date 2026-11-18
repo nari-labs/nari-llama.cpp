@@ -20,6 +20,7 @@
 // dst[t][j] = src[t][idx[j]] for j < n, t < rows
 static __global__ void trellis_gather(const float * __restrict__ src, int64_t src_stride, const int32_t * __restrict__ idx,
                                       float * __restrict__ dst, int64_t dst_stride, int n) {
+    ggml_cuda_pdl_lc();
     const int64_t t = blockIdx.y;
     for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < n; j += gridDim.x * blockDim.x) {
         dst[t * dst_stride + j] = src[t * src_stride + idx[j]];
@@ -51,6 +52,7 @@ struct trellis_gather_set {
 };
 
 static __global__ void trellis_gather_multi(const trellis_gather_set set) {
+    ggml_cuda_pdl_lc();
     const trellis_gather_seg g = set.seg[blockIdx.z];
     const int64_t t = blockIdx.y;
     for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < g.n; j += gridDim.x * blockDim.x) {

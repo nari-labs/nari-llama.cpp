@@ -187,6 +187,14 @@ __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_grou
 template <int N>
 __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N)); }
 
+// Lets the next kernel on the stream, if it was launched with programmatic stream serialization, start early: it still
+// waits for this grid's completion (griddepcontrol.wait) before it reads what this grid writes. A no-op before sm_90.
+__device__ __forceinline__ void launch_dependents() {
+#if __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
 __device__ __forceinline__ float warp_max(float m) {
 #pragma unroll
     for (int o = 16; o; o /= 2) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
