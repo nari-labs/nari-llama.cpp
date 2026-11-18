@@ -92,7 +92,7 @@ jobs:
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
           cmake -S . -B build-cuda -G "Ninja Multi-Config" -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF -DGGML_CPU=OFF ^
             -DGGML_CUDA=ON -DGGML_CUDA_CCCL_VERSION=v3.4.3 -DLLAMA_BUILD_BORINGSSL=ON ^
-            -DCMAKE_CUDA_ARCHITECTURES:STRING="50-virtual;61-virtual;70-virtual;75-virtual;80-virtual;86-real;89-real;90-virtual;120a-real" ^
+            -DCMAKE_CUDA_ARCHITECTURES:STRING="50-virtual;61-virtual;70-virtual;75-virtual;80-virtual;86-real;89-real;90-real;90-virtual;120a-real" ^
             -DGGML_CUDA_TRELLIS_DIR=%GITHUB_WORKSPACE:\=/%/ggml/src/ggml-cuda/libtrellis
           if errorlevel 1 exit /b 1
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1

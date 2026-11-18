@@ -9,8 +9,8 @@ Ollama and LM Studio cannot load those files.
   - glibc 2.34 or newer;
   - libstdc++ providing `GLIBCXX_3.4.30` (updated Ubuntu 22.04 or Debian 12 meet these runtime requirements);
   - libgomp.
-- GPUs: real code for RTX 30xx, RTX 40xx / L4 and RTX 50xx / RTX PRO 6000. Any other card of compute capability 8.0
-  or newer (A100, H100) compiles PTX on the first run.
+- GPUs: real code for RTX 30xx, RTX 40xx / L4, H100 / H200 and RTX 50xx / RTX PRO 6000. Any other card of compute
+  capability 8.0 or newer (A100, B200) compiles PTX on the first run, about 50 s.
 - Without a GPU, the CPU backend runs, with the best variant for the processor chosen at start.
 
 ```bash

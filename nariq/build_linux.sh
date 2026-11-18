@@ -14,7 +14,7 @@ CUDA="$(nvcc --version | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p')"
 BUILD="${NARIQ_BUILD_DIR:-$ROOT/nariq-build/linux}"
 NAME="nari-llama.cpp-$TAG-bin-linux-cuda-$CUDA-x64"
 CUDART="cudart-nari-llama.cpp-$TAG-linux-cuda-$CUDA-x64"
-ARCHS="${CUDA_ARCHS:-50-virtual;61-virtual;70-virtual;75-virtual;80-virtual;86-real;89-real;90-virtual;120a-real}"
+ARCHS="${CUDA_ARCHS:-50-virtual;61-virtual;70-virtual;75-virtual;80-virtual;86-real;89-real;90-real;90-virtual;120a-real}"
 args=("-DCMAKE_CUDA_ARCHITECTURES:STRING=$ARCHS")
 python3 "$HERE/prepare_ui.py"
 # Docker COPY changes file timestamps. Refresh Git's stat cache before CMake's
