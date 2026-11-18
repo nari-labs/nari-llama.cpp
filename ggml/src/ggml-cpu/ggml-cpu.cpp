@@ -439,6 +439,18 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         }
     }
 
+    // the trellis types have no to_float, from_float or vec_dot: only the trellis ops read them
+    if (op->op != GGML_OP_TRELLIS && op->op != GGML_OP_TRELLIS_GET_ROWS) {
+        if (ggml_is_trellis_type(op->type)) {
+            return false;
+        }
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            if (op->src[i] && ggml_is_trellis_type(op->src[i]->type)) {
+                return false;
+            }
+        }
+    }
+
     switch (op->op) {
         case GGML_OP_CPY:
         case GGML_OP_SET_ROWS:
@@ -467,11 +479,14 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 return true;
             }
         case GGML_OP_TRELLIS_GET_ROWS:
-            return src0->buffer == nullptr || ggml_backend_buft_is_host(src0->buffer->buft);
-        case GGML_OP_MUL_MAT:
-            if (ggml_is_trellis_type(src0->type)) {
-                return false; // trellis fork: a coded weight is only read by GGML_OP_TRELLIS (no per-row vec_dot)
+            {
+                const int32_t * desc = (const int32_t *) op->op_params;
+                return ggml_is_trellis_type(src0->type) && src1->type == GGML_TYPE_I32 && desc[0] == 0 &&
+                       desc[6] >= 0 && desc[6] <= 8 &&
+                       ggml_trellis_desc_supported(src0->ne[0], src0->ne[1], desc, 7 + desc[6]) &&
+                       (src0->buffer == nullptr || ggml_backend_buft_is_host(src0->buffer->buft));
             }
+        case GGML_OP_MUL_MAT:
             if (ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
                 src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) {
                 return src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16;

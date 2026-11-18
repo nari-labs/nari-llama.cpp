@@ -102,6 +102,26 @@ int main() {
     const int32_t invalid[] = {1, 3, 1, 0, 0, 1, 1, 128};
     check(!ggml_trellis_desc_supported(256, 128, invalid, 8), "invalid Hadamard block accepted");
     check(!ggml_trellis_desc_supported(256, 128, nullptr, 0), "missing descriptor accepted");
+    {
+        // a coded weight has no per-row decode or dot product: only the trellis ops may read it
+        auto * ctx = ggml_init({1024 * 1024, nullptr, true});
+        auto * w = ggml_new_tensor_2d(ctx, GGML_TYPE_TRL2, 256, 128);
+        auto * e = ggml_new_tensor_3d(ctx, GGML_TYPE_TRL2, 256, 128, 2);
+        auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 4);
+        auto * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4);
+        auto * eids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, 4);
+        auto * s = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, 256 / 16);
+        auto * pre = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 256);
+        auto * post = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
+        const int32_t rotated[] = {1, 128, 1, 0, 0, 1, 1, 128};
+        check(!ggml_backend_supports_op(backend, ggml_get_rows(ctx, w, ids)), "CPU accepts get_rows on a coded weight");
+        check(!ggml_backend_supports_op(backend, ggml_mul_mat(ctx, w, x)), "CPU accepts mul_mat on a coded weight");
+        check(!ggml_backend_supports_op(backend, ggml_mul_mat_id(ctx, e, ggml_reshape_3d(ctx, x, 256, 1, 4), eids)),
+            "CPU accepts mul_mat_id on coded experts");
+        check(!ggml_backend_supports_op(backend, ggml_trellis_get_rows(ctx, w, ids, s, pre, post, rotated, 8)),
+            "CPU accepts embedding rows with a rotated row side");
+        ggml_free(ctx);
+    }
     for (int bits = 1; bits <= 6; ++bits) {
         for (int mode = 0; mode < 3; ++mode) {
             for (int columns : {1, 7}) { run(backend, bits, mode, columns); }
