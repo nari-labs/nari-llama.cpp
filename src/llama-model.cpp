@@ -1691,6 +1691,36 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
     vocab.load(ml, kv);
 }
 
+// the trellis gathers index activations and logits without bounds checks in every backend, so a file whose gathers
+// are not permutations is rejected once here instead of reading out of bounds at run time
+static void check_trellis_gathers(const llama_trellis & trellis) {
+    std::vector<int32_t> idx;
+    std::vector<uint8_t> seen;
+    auto check = [&](const ggml_tensor * t) {
+        if (t == nullptr) {
+            return;
+        }
+        const int64_t n = ggml_nelements(t);
+        idx.resize(n);
+        ggml_backend_tensor_get(t, idx.data(), 0, n * sizeof(int32_t));
+        seen.assign(n, 0);
+        for (int64_t i = 0; i < n; ++i) {
+            const int32_t v = idx[i];
+            if (v < 0 || v >= n || seen[v]) {
+                throw std::runtime_error(format("trellis: %s is not a permutation of [0, %lld): entry %lld is %d",
+                        ggml_get_name(t), (long long) n, (long long) i, v));
+            }
+            seen[v] = 1;
+        }
+    };
+    for (const auto & it : trellis.weights) {
+        check(it.second.pin);
+        check(it.second.pout);
+    }
+    check(trellis.vocab_gather);
+    check(trellis.embed_gather);
+}
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
@@ -2173,6 +2203,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     load_tensors_hadamard();
 
+    check_trellis_gathers(trellis);
+
     return true;
 }
 
@@ -2522,6 +2554,14 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
     return t;
 }
 
+// the trellis ops assert their inputs' types; a file with other types is refused here, naming the tensor
+static void check_trellis_type(const ggml_tensor * t, ggml_type type) {
+    if (t != nullptr && t->type != type) {
+        throw std::runtime_error(format("trellis: %s is %s, expected %s", ggml_get_name(t), ggml_type_name(t->type),
+                ggml_type_name(type)));
+    }
+}
+
 // trellis fork: the side tensors are named after the weight, its suffix's trailing "weight" replaced by trellis_<side>
 // (blk.0.attn_qkv.weight -> blk.0.attn_qkv.trellis_pre), and created with the weight's tensor info, so they land on its
 // device and buffer type
@@ -2551,6 +2591,11 @@ void llama_model_base::create_trellis_sides(llama_model_loader & ml, const LLM_T
     tw.post = side("trellis_post", {N},      0);
     tw.pin  = side("trellis_pin",  {K},      TENSOR_NOT_REQUIRED);
     tw.pout = side("trellis_pout", {N},      TENSOR_NOT_REQUIRED);
+    check_trellis_type(tw.s16,  GGML_TYPE_F16);
+    check_trellis_type(tw.pre,  GGML_TYPE_F32);
+    check_trellis_type(tw.post, GGML_TYPE_F32);
+    check_trellis_type(tw.pin,  GGML_TYPE_I32);
+    check_trellis_type(tw.pout, GGML_TYPE_I32);
     const std::string name = tn.str();
     const std::string key = "trellis.desc." + name.substr(0, name.size() - 7);
     ml.get_arr(key, tw.desc, true);
@@ -2580,6 +2625,7 @@ bool llama_model_base::create_trellis_bands(int64_t n_embd, int64_t n_vocab) {
         throw std::runtime_error(format("trellis: the lm_head bands hold %lld rows, the vocabulary %lld", (long long) rows, (long long) n_vocab));
     }
     trellis.vocab_gather = create_tensor(tn(LLM_TENSOR_OUTPUT, "vocab_gather"), {n_vocab}, 0);
+    check_trellis_type(trellis.vocab_gather, GGML_TYPE_I32);
     LLAMA_LOG_INFO("%s: trellis lm_head in %u coded bands\n", __func__, n_bands);
     return true;
 }
@@ -2608,6 +2654,7 @@ bool llama_model_base::create_trellis_embed_bands(int64_t n_embd, int64_t n_voca
         throw std::runtime_error(format("trellis: the embedding bands hold %lld rows, the vocabulary %lld", (long long) rows, (long long) n_vocab));
     }
     trellis.embed_gather = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "vocab_gather"), {n_vocab}, 0);
+    check_trellis_type(trellis.embed_gather, GGML_TYPE_I32);
     LLAMA_LOG_INFO("%s: trellis embedding in %u coded bands\n", __func__, n_bands);
     return true;
 }
