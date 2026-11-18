@@ -1,6 +1,6 @@
 # NariQ runtime and build tools
 
-This fork adds NariQ trellis-coded Qwen3.8 weights to llama.cpp. It includes TRL1-TRL6 tensor types, the converter, the model loader, CPU operations, and CUDA kernels from the vendored Apache-2.0 libtrellis. The NariQ additions retain Apache-2.0 licensing; upstream llama.cpp retains its MIT license. See [NOTICE](NOTICE).
+This fork adds NariQ trellis-coded Qwen3.8 weights to llama.cpp. It includes TRL1-TRL6 tensor types, the converter, the model loader, CPU operations, native Metal coded products, and CUDA kernels from the vendored Apache-2.0 libtrellis. The NariQ additions retain Apache-2.0 licensing; upstream llama.cpp retains its MIT license. See [NOTICE](NOTICE).
 
 The initial integration is based on upstream b12431 (`a946eb541a6d3051496bdcc451a0fa85772b8dfd`). `TAG` reserves `b12431-nari2` for the next candidate; it is not a published release. No workflow in this fork creates releases or pushes container images.
 
@@ -25,7 +25,7 @@ ctest --test-dir build-cpu --output-on-failure -R test-trellis
 ./build-cpu/bin/llama-server -m /path/to/model.gguf -ngl 0
 ```
 
-The model and projector are supplied separately. NariQ Metal, Vulkan and HIP GPU kernels are not implemented. Apple Silicon CPU builds are not a claim of Apple GPU support or full-model qualification. LoRA adapters are rejected for NariQ models, because the coded and banded tensors do not yet implement adapter application.
+For native Apple GPU builds, tests and current qualification limits, see [README-metal.md](README-metal.md). The model and projector are supplied separately. Vulkan and HIP coded kernels are not implemented. Synthetic Metal correctness tests do not establish full-model qualification. LoRA adapters are rejected for NariQ models, because the coded and banded tensors do not yet implement adapter application.
 
 ## Convert an existing NariQ checkpoint
 

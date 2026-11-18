@@ -1,6 +1,6 @@
 # nari-llama.cpp
 
-The Nari Labs fork of llama.cpp, with NariQ trellis-coded Qwen3.8-27B inference. It includes TRL1-TRL6 tensors, checkpoint conversion, the model loader, CPU operations and vendored CUDA/libtrellis kernels.
+The Nari Labs fork of llama.cpp, with NariQ trellis-coded Qwen3.8-27B inference. It includes TRL1-TRL6 tensors, checkpoint conversion, the model loader, CPU operations, native Metal coded products and vendored CUDA/libtrellis kernels.
 
 This is a development candidate based on upstream b12431. No NariQ release is published yet. Build this checkout to use the custom tensor format.
 
@@ -22,13 +22,15 @@ cmake --build build-cpu -j 4
 ./build-cpu/bin/llama-server -m /path/to/model.gguf -ngl 0
 ```
 
+For native Apple Silicon Metal builds and hardware checks, see [the Metal guide](nariq/README-metal.md). Coded products run on GPU; coded embeddings use CPU fallback.
+
 Supply the NariQ GGUF and optional BF16 vision projector separately. The converter accepts existing native-trellis checkpoints; it does not quantize ordinary BF16 checkpoints into NariQ.
 
 ## Device support
 
-- NariQ coded products run on CPU or NVIDIA GPUs of compute capability 8.0 or newer. Coded embeddings currently execute on CPU.
+- NariQ coded products run on CPU, Apple Metal, or NVIDIA GPUs of compute capability 8.0 or newer. Coded embeddings currently execute on CPU.
 - Linux and Windows CUDA artifact builds and CPU startup checks have passed. Exact-package GPU qualification remains required.
-- Apple Silicon CPU qualification is pending. NariQ Metal, Vulkan, HIP and SYCL acceleration is not implemented.
+- Metal numerical, CPU fallback and bounded text parity checks for all three weight budgets pass on an M3 Pro. The two-task DeepSWE subset timed out on both tasks. Broader Apple GPU qualification, performance tuning and macOS packages remain pending. Vulkan, HIP and SYCL coded kernels are not implemented.
 - Desktop/server coverage across Apple, NVIDIA, AMD, Intel and x86-64/ARM64 CPUs is the target described in the [device coverage plan](nariq/device-support.md).
 - LoRA adapters on NariQ weights are unsupported and rejected explicitly.
 

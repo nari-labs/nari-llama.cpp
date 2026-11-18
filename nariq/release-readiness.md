@@ -22,12 +22,12 @@ These are runtime correctness checks. No scored benchmark needs to be resumed or
 | --- | --- | --- |
 | Linux NVIDIA, compute capability 8.0+ | Coded linear CUDA kernels; coded embeddings on CPU | Functional checks passed; numerical acceptance and real GeForce qualification remain open |
 | Windows NVIDIA | CPU/CUDA implementation; native artifact build and CPU startup checks passed | Real GPU execution and exact-package parity; a native build does not establish CUDA runtime correctness |
-| macOS Apple Silicon CPU | Portable scalar decoder with generic NEON product path | ARM CI, then full-model execution on a sufficiently large Mac |
-| Apple Metal | No custom trellis kernels | Separate backend implementation and hardware validation |
+| macOS Apple Silicon CPU | Portable scalar decoder with generic NEON product path; M3 Pro numerical and bounded three-model text checks pass | ARM CI, broader model/hardware qualification and macOS packages |
+| Apple Metal | Native compressed TRL1-6 products and transforms; CPU embeddings; M3 Pro numerical, mixed scheduler and bounded three-model text parity pass | Long-context/vision/concurrency parity, performance tuning and qualification, more devices and macOS packages |
 | AMD HIP / Vulkan | No custom trellis kernels | Separate backend implementations; do not advertise NariQ GPU acceleration |
 | Older NVIDIA / CPU-only | CPU fallback | Slow execution; no GPU acceleration promise |
 
-Apple GPU support requires dispatch for the trellis operations, 1-6-bit tile decoding, scales, permutation gathers and Hadamard transforms, decode/prefill products that retain compressed weights, and correct fallback and tensor placement. A CPU build passing on macOS is not a substitute. Hosted ARM runners can run small numerical tests but do not have enough memory for meaningful 27B-model qualification.
+The Metal implementation includes coded-product dispatch, 1-6-bit tile decoding, scales, permutation gathers, block and whole-slice Hadamard transforms, and decode/prefill products that retain compressed weights. Mixed scheduler tests cover CPU embeddings feeding Metal banded output heads. The fixed two-task DeepSWE subset produced two agent timeouts and native reward 0 for each task; its agent traces are incomplete. See [README-metal.md](README-metal.md) for scope, local evidence and remaining limits. A CPU build passing on macOS is not a substitute for GPU execution evidence. Hosted ARM runners can run small numerical tests but do not have enough memory for meaningful 27B-model qualification.
 
 See [device-support.md](device-support.md) for the broader device matrix and implementation work needed beyond NVIDIA CUDA. Successful Linux and Windows artifact builds establish buildability and package startup; GPU execution remains a separate qualification gate.
 
