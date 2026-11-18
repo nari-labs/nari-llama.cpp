@@ -4,7 +4,7 @@
 # llama-server with an OpenAI-compatible API and a chat page at http://127.0.0.1:8080.
 #
 #   ./run.sh                    # the 3-bit file, with vision, the longest context the GPU's free memory holds
-#   ./run.sh 2.5                # the 2.5-bit file (2.0: the 2-bit one); 3bit / 2.5bit / 2bit work too
+#   ./run.sh 2.5                # the 2.5 bpw file (2.0: the 2.0 bpw one); 3.0bpw / 3bit and the like work too
 #   ./run.sh 3.0 --docker       # the same through the Docker image (needs the NVIDIA Container Toolkit)
 #   ./run.sh 3.0 --no-vision -- -np 4 -c 131072    # arguments after -- go to llama-server unchanged
 #
@@ -28,7 +28,7 @@ HOME_DIR="${TRELLIS_HOME:-$HOME/.cache/nari-llama.cpp}"
 CUDA=12.8
 
 # file, size in bytes and sha256 per budget; the layout of these files is frozen
-declare -A FILE=([3.0]=Qwen3.8-27B-NariQ-3bit.gguf [2.5]=Qwen3.8-27B-NariQ-2.5bit.gguf [2.0]=Qwen3.8-27B-NariQ-2bit.gguf)
+declare -A FILE=([3.0]=Qwen3.8-27B-NariQ-3.0bpw.gguf [2.5]=Qwen3.8-27B-NariQ-2.5bpw.gguf [2.0]=Qwen3.8-27B-NariQ-2.0bpw.gguf)
 declare -A SIZE=([3.0]=10123626592 [2.5]=8443119712 [2.0]=6753954304)
 declare -A SHA=([3.0]=1eaad934aa05579b8eba47ed9b26450392f9875fc2354efe8cfa8b29be8f4419
                 [2.5]=2445372e6de20620b940fbfab53aa718af9ba741f202da30cd2f02b5df78d05c
@@ -41,6 +41,7 @@ extra=()
 while [ $# -gt 0 ]; do
     case "$1" in
         3.0|2.5|2.0) budget="$1" ;;
+        3.0bpw|2.5bpw|2.0bpw) budget="${1%bpw}" ;;
         3bit|2.5bit|2bit) budget="${1%bit}"; [ "$budget" = 3 ] && budget=3.0; [ "$budget" = 2 ] && budget=2.0 ;;
         --port|--host)
             [ $# -ge 2 ] && [ -n "$2" ] || { echo "run.sh: $1 requires a value" >&2; exit 2; }

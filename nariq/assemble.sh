@@ -30,12 +30,12 @@ models)
     [ $# -eq 3 ] || { echo "usage: assemble.sh models GGUF_DIR OUT" >&2; exit 2; }
     gguf="$2" out="$3"
     prepare_out "$out"
-    declare -A FROM=([Qwen3.8-27B-NariQ-3bit.gguf]=qwen38-27b-3.0-permattn-trellis.gguf
-                     [Qwen3.8-27B-NariQ-2.5bit.gguf]=qwen38-27b-2.5-permattn-trellis.gguf
-                     [Qwen3.8-27B-NariQ-2bit.gguf]=qwen38-27b-2.0-permattn-trellis.gguf
+    declare -A FROM=([Qwen3.8-27B-NariQ-3.0bpw.gguf]=qwen38-27b-3.0-permattn-trellis.gguf
+                     [Qwen3.8-27B-NariQ-2.5bpw.gguf]=qwen38-27b-2.5-permattn-trellis.gguf
+                     [Qwen3.8-27B-NariQ-2.0bpw.gguf]=qwen38-27b-2.0-permattn-trellis.gguf
                      [Qwen3.8-27B-NariQ-mmproj-BF16.gguf]=qwen38-27b-mmproj-bf16.gguf)
     files=()
-    for name in Qwen3.8-27B-NariQ-3bit.gguf Qwen3.8-27B-NariQ-2.5bit.gguf Qwen3.8-27B-NariQ-2bit.gguf \
+    for name in Qwen3.8-27B-NariQ-3.0bpw.gguf Qwen3.8-27B-NariQ-2.5bpw.gguf Qwen3.8-27B-NariQ-2.0bpw.gguf \
                 Qwen3.8-27B-NariQ-mmproj-BF16.gguf; do
         want="$(grep -F "\"$name\"" "$HERE/run.ps1" | grep -o "[0-9a-f]\{64\}" | head -n 1)" || true
         [ -n "$want" ] || { echo "assemble.sh: run.ps1 pins no sha256 for $name" >&2; exit 1; }

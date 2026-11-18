@@ -4,14 +4,14 @@
 # http://127.0.0.1:8080.
 #
 #   powershell -ExecutionPolicy Bypass -File run.ps1                 # the 3.0 file, with vision, the longest context
-#   powershell -ExecutionPolicy Bypass -File run.ps1 -Budget 2.5            # or 2.0; 3bit / 2.5bit / 2bit work too
+#   powershell -ExecutionPolicy Bypass -File run.ps1 -Budget 2.5            # or 2.0; 3.0bpw / 3bit and the like work too
 #   powershell -ExecutionPolicy Bypass -File run.ps1 -NoVision -Extra "-np","4","-c","131072"
 #
 # Environment: TRELLIS_HOME (download folder, %LOCALAPPDATA%\nari-llama.cpp); TRELLIS_RELEASE_URL, TRELLIS_MODEL_URL
 # and TRELLIS_TAG (mirrors and tests). Needs Windows 10 1803 or newer (curl.exe) and an NVIDIA driver of 572 or newer.
 # Without a GPU it runs on the CPU, slowly.
 param(
-    [ValidateSet("3.0", "2.5", "2.0", "3bit", "2.5bit", "2bit")][string]$Budget = "3.0",
+    [ValidateSet("3.0", "2.5", "2.0", "3.0bpw", "2.5bpw", "2.0bpw", "3bit", "2.5bit", "2bit")][string]$Budget = "3.0",
     [int]$Port = 8080,
     [string]$ListenHost = "127.0.0.1",
     [switch]$NoVision,
@@ -19,7 +19,7 @@ param(
     [string[]]$Extra = @()
 )
 $ErrorActionPreference = "Stop"
-$Aliases = @{ "3bit" = "3.0"; "2.5bit" = "2.5"; "2bit" = "2.0" }
+$Aliases = @{ "3.0bpw" = "3.0"; "2.5bpw" = "2.5"; "2.0bpw" = "2.0"; "3bit" = "3.0"; "2.5bit" = "2.5"; "2bit" = "2.0" }
 if ($Aliases.ContainsKey($Budget)) { $Budget = $Aliases[$Budget] }
 
 $Tag = if ($env:TRELLIS_TAG) { $env:TRELLIS_TAG } else { "b12431-nari2" }  # the release tag
@@ -30,9 +30,9 @@ $Cuda = "12.8"
 
 # file and sha256 per budget; the layout of these files is frozen
 $Files = @{
-    "3.0" = @("Qwen3.8-27B-NariQ-3bit.gguf", "1eaad934aa05579b8eba47ed9b26450392f9875fc2354efe8cfa8b29be8f4419")
-    "2.5" = @("Qwen3.8-27B-NariQ-2.5bit.gguf", "2445372e6de20620b940fbfab53aa718af9ba741f202da30cd2f02b5df78d05c")
-    "2.0" = @("Qwen3.8-27B-NariQ-2bit.gguf", "3a9e4955329dba8ba0be5509a9552220e5ccdae2f66bcc72c21c4580cd49bbb2")
+    "3.0" = @("Qwen3.8-27B-NariQ-3.0bpw.gguf", "1eaad934aa05579b8eba47ed9b26450392f9875fc2354efe8cfa8b29be8f4419")
+    "2.5" = @("Qwen3.8-27B-NariQ-2.5bpw.gguf", "2445372e6de20620b940fbfab53aa718af9ba741f202da30cd2f02b5df78d05c")
+    "2.0" = @("Qwen3.8-27B-NariQ-2.0bpw.gguf", "3a9e4955329dba8ba0be5509a9552220e5ccdae2f66bcc72c21c4580cd49bbb2")
 }
 $Mmproj = @("Qwen3.8-27B-NariQ-mmproj-BF16.gguf", "8832425f593068d3278e08eda4c1591072c7a2d8dc90f21e4f86394e4b2eb002")
 

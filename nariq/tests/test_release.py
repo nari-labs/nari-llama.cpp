@@ -113,7 +113,7 @@ class ReleaseTests(unittest.TestCase):
         script = re.sub(r"[a-f0-9]{64}", sha, script)
         launcher = self.root / "run.sh"
         launcher.write_text(script)
-        (web / "Qwen3.8-27B-NariQ-3bit.gguf").write_bytes(model)
+        (web / "Qwen3.8-27B-NariQ-3.0bpw.gguf").write_bytes(model)
         sums = []
         for prefix in (f"nari-llama.cpp-{self.tag}-bin", f"cudart-nari-llama.cpp-{self.tag}"):
             name = f"{prefix}-linux-cuda-12.8-x64"
@@ -140,9 +140,9 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--alias\ntest model\n", result.stdout)
         self.assertEqual(result.stdout.splitlines().count("-t"), 1)
-        self.assertEqual((self.root / "cache/models/Qwen3.8-27B-NariQ-3bit.gguf").read_bytes(), model)
+        self.assertEqual((self.root / "cache/models/Qwen3.8-27B-NariQ-3.0bpw.gguf").read_bytes(), model)
         shutil.rmtree(self.root / "cache")
-        (web / "Qwen3.8-27B-NariQ-3bit.gguf").write_bytes(b"corrupt")
+        (web / "Qwen3.8-27B-NariQ-3.0bpw.gguf").write_bytes(b"corrupt")
         bad = command("bash", str(launcher), "--no-vision", env=self.env)
         self.assertNotEqual(bad.returncode, 0)
         self.assertIn("does not match its sha256", bad.stderr)
