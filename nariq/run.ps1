@@ -5,7 +5,8 @@
 #
 #   powershell -ExecutionPolicy Bypass -File run.ps1                 # the 3.0 file, with vision, the longest context
 #   powershell -ExecutionPolicy Bypass -File run.ps1 -Budget 2.5            # or 2.0; 3.0bpw / 3bit and the like work too
-#   powershell -ExecutionPolicy Bypass -File run.ps1 -NoVision -Extra "-np","4","-c","131072"
+#   powershell -ExecutionPolicy Bypass -Command "& .\run.ps1 -NoVision -Extra '-np','4','-c','131072'"
+#   (with -File, PowerShell passes a list as one string, so -Extra needs -Command)
 #
 # Environment: TRELLIS_HOME (download folder, %LOCALAPPDATA%\nari-llama.cpp); TRELLIS_RELEASE_URL, TRELLIS_MODEL_URL
 # and TRELLIS_TAG (mirrors and tests). Needs Windows 10 1803 or newer (curl.exe) and an NVIDIA driver of 572 or newer.
@@ -40,8 +41,9 @@ $smi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
 $gpu = $null
 if ($smi) {
     try {
-        $gpu = (& nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>$null | Select-Object -First 1)
-        if ($LASTEXITCODE -ne 0) { $gpu = $null }
+        # Capture first: a pipeline into Select-Object leaves $LASTEXITCODE unset or stale.
+        $out = @(& nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $out.Count -gt 0) { $gpu = $out[0] }
     } catch {
         # Windows PowerShell 5.1 can turn native stderr into a terminating error.
         $gpu = $null
