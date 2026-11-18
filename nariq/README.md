@@ -25,7 +25,20 @@ ctest --test-dir build-cpu --output-on-failure -R test-trellis
 ./build-cpu/bin/llama-server -m /path/to/model.gguf -ngl 0
 ```
 
-For native Apple GPU builds, tests and current qualification limits, see [README-metal.md](README-metal.md). The model and projector are supplied separately. Vulkan and HIP coded kernels are not implemented. Synthetic Metal correctness tests do not establish full-model qualification. LoRA adapters are rejected for NariQ models, because the coded and banded tensors do not yet implement adapter application.
+### macOS with Apple Silicon (Metal): experimental, build from source
+
+There is no macOS binary. Build on an Apple Silicon Mac with the Xcode command line tools:
+
+```sh
+cmake -S . -B build-metal -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON -DGGML_CUDA=OFF
+cmake --build build-metal -j 4
+./build-metal/bin/llama-server -m /path/to/model.gguf -ngl 99 --jinja
+```
+
+Coded products run on the GPU (Apple GPU family 7 or newer, M1 and later); coded embeddings run on the CPU. Only an
+M3 Pro with 18 GB has run it: decode was about 3.8, 4.0 and 4.9 tokens/s for the 3.0, 2.5 and 2.0 bpw files in short
+runs, far slower than CUDA. Other Macs, long contexts, vision and concurrent sessions are untested. Details, tests and
+measurements: [README-metal.md](README-metal.md). The model and projector are supplied separately. Vulkan and HIP coded kernels are not implemented. Synthetic Metal correctness tests do not establish full-model qualification. LoRA adapters are rejected for NariQ models, because the coded and banded tensors do not yet implement adapter application.
 
 ## Convert an existing NariQ checkpoint
 

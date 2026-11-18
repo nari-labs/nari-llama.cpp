@@ -69,7 +69,7 @@ The requested 50 tokens/s single-sequence decode target has not been reached. Th
 
 On 2026-11-18, eight larger redesign configurations tested register matrix multiplication, cooperative split-K reductions, contiguous K chunks, and global or banked on-chip codebooks. Every bounded CPU/Metal logits comparison passed, but none improved throughput. Five repetitions of 32 generated tokens measured 4.98 tokens/s for the restored implementation, 3.51 for the matrix-instruction redesign and 3.37 for cooperative split-K. The earlier frozen-runtime control measured 4.54 tokens/s; all redesigns were slower than both controls. Codebook variants were slower in short captures. The original implementation was restored byte for byte. Final checks passed for all three pinned models, including shader validation and private buffers. Detailed Instruments GPU counters reported an unsupported counter profile on this Mac; precise ALU and DRAM stall attribution remains unresolved. No local inference service or DeepSWE job was restarted.
 
-The local server also passed a deterministic arithmetic response, a streamed Anthropic tool call, and use of a tool result. A native Claude Code smoke test wrote and ran a Python addition function, verified `add(7, 8) == 15`, and retained a complete 41-record trace. Native compatibility checks identified and fixed effort `max` mapping to `xhigh` for templates with those capabilities, honoring disabled thinking, and consolidating extra system messages while retaining their text.
+The local server also passed a deterministic arithmetic response, a streamed tool call, and use of a tool result.
 
 ### DeepSWE subset
 
@@ -105,5 +105,3 @@ python3 nariq/compare_logits.py /path/to/cpu /path/to/metal \
 ```
 
 The Metal check records its own greedy choices while evaluating the reference continuation tokens. This holds model inputs fixed if generation diverges. The comparator checks complete metadata, file sizes, finite logits, full-distribution KL, top-1 agreement and artifact hashes. Its default short-check gate is maximum KL 1e-3 with every top-1 choice matching. A failed or interrupted capture must not be reported as complete. The captured throughput includes logits reads and file writes.
-
-For coding-agent checks, model inference can stay on the Mac while task containers run on a Linux host. `nariq/http_proxy.py` provides a small streaming HTTP forwarder for a dedicated SSH tunnel endpoint. It forwards request bodies unchanged, retains API authentication, and does not log authentication headers. Its optional request-body capture is for private validation artifacts; redact any credential values from tool output before sharing traces. Keep native agent prompts, budgets, attempts, timeouts and grading fixed within a run, and report any smaller context or task subset explicitly.
