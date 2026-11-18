@@ -422,7 +422,12 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    // decode of the only sequence of a one-slot cache: the delta net reads the cached state in place instead of a
+    // gathered copy (can_reuse checks rs_z, so a reused graph keeps this choice valid)
+    // TODO: enabled for models with coded linears only until it is measured on others
+    const bool state_in_place = !model.trellis.weights.empty() && n_seq_tokens == 1 && n_seqs == 1 &&
+        ssm_states_all->ne[1] == 1 && ssm_states_all->type == GGML_TYPE_F32 && mctx_cur->get_rs_z() < 0;
+    ggml_tensor * state = state_in_place ? ssm_states_all : build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
@@ -464,8 +469,19 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    // one token: q and k are adjacent heads of equal width in the convolved row, so one norm covers both
+    // TODO: enabled for models with coded linears only until it is measured on others
+    if (!model.trellis.weights.empty() && n_seq_tokens == 1 && n_seqs == 1) {
+        GGML_ASSERT(ggml_are_same_shape(q_conv, k_conv) && q_conv->nb[1] == k_conv->nb[1]);
+        GGML_ASSERT(k_conv->view_offs == q_conv->view_offs + num_k_heads*q_conv->nb[1]);
+        ggml_tensor * qk = ggml_view_2d(ctx0, conv_qkv_mix, head_k_dim, 2*num_k_heads, q_conv->nb[1], q_conv->view_offs);
+        qk = build_gdn_l2_norm(ctx0, qk, eps_norm);
+        q_conv = ggml_view_2d(ctx0, qk, head_k_dim, num_k_heads, qk->nb[1], 0);
+        k_conv = ggml_view_2d(ctx0, qk, head_k_dim, num_k_heads, qk->nb[1], num_k_heads*qk->nb[1]);
+    } else {
+        q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
+        k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    }
 
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
