@@ -19,17 +19,10 @@
 // Every tiling sums an output's k-tiles in the same order (one accumulator per (output, row, split), k-tile by
 // k-tile), and the splits depend on the shape and the device only, so the result does not depend on the tiling, and
 // two calls give the same bytes.
-//
-// The earlier path (V decoded exactly to fp16 in L2-sized chunks, cuBLAS) stays for A/B timing: TQ_GEMM_DENSE=1 in the
-// environment (read by every tq_gemm and tq_gemm_workspace_bytes call) selects it.
-#include <cublas_v2.h>
 #include <cuda_bf16.h>
 
 #include <algorithm>
 #include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <mutex>
 #include <type_traits>
 
 #include "common.cuh"
@@ -390,9 +383,10 @@ cudaError_t launch_d(const Pf& a, int tiling, cudaStream_t s) {
     return launch_t<K, 64, 8, 2, D>(a, s);
 }
 
+// version 4's decode chain: version 6's is no faster in this kernel
 template <int K>
-cudaError_t launch_pf(const Pf& a, int tiling, int decode6, cudaStream_t s) {
-    return decode6 ? launch_d<K, 1>(a, tiling, s) : launch_d<K, 0>(a, tiling, s);
+cudaError_t launch_pf(const Pf& a, int tiling, cudaStream_t s) {
+    return launch_d<K, 0>(a, tiling, s);
 }
 
 // The engine's choice: the tiling whose most loaded SM finishes first, in units of one 128-row CTA alone on an SM
@@ -408,27 +402,6 @@ int pick_tiling(int rows, int nt, int splits) {
     const float t_c8 = (float)((c128 + sms - 1) / sms), t_x2 = load(c128, 1.8f, 1.03f), t_64 = load(c64, 1.1f, 0.6f);
     if (t_64 < t_x2 && t_64 < t_c8) return T64X8;
     return t_c8 < t_x2 ? T128X8 : T128X4;
-}
-
-// environment overrides, read per call (A/B timing and tests): TQ_GEMM_TILE = 64x8 / 128x8 / 128x4; TQ_GEMM_DECODE =
-// 4 (version 4's chain, the engine's version 5) or 6 (version 6's)
-int env_tiling() {
-    const char* v = std::getenv("TQ_GEMM_TILE");
-    if (v == nullptr) return -1;
-    if (!strcmp(v, "64x8")) return T64X8;
-    if (!strcmp(v, "128x8")) return T128X8;
-    if (!strcmp(v, "128x4")) return T128X4;
-    return -1;
-}
-
-int env_decode6() {  // version 6's decode measured no faster here (0.99-1.00x), so version 4's is the default
-    const char* v = std::getenv("TQ_GEMM_DECODE");
-    return v != nullptr && !strcmp(v, "6") ? 1 : 0;
-}
-
-bool env_dense() {
-    const char* v = std::getenv("TQ_GEMM_DENSE");
-    return v != nullptr && v[0] != '\0' && strcmp(v, "0") != 0;
 }
 
 // Split-K for grids that leave the GPU idle (few column blocks: in_proj_a/b's 48 outputs, k/v_proj's 1,024, at prefill
@@ -499,225 +472,17 @@ int fused(const tq_matrix* m, const void* x, tq_dtype x_type, int64_t x_stride, 
     a.kb = l.kb, a.splits = l.splits, a.part = reinterpret_cast<float*>(w + l.part);
     a.post = post, a.had = (flags & TQ_HAD128_OUT) ? 1 : 0;
     a.out = out, a.out_type = out_type, a.out_stride = out_stride;
-    const int forced = env_tiling(), d6 = env_decode6();
-    const int tiling = forced >= 0 ? forced : pick_tiling(rows, a.nt, a.splits);
+    const int tiling = pick_tiling(rows, a.nt, a.splits);
     cudaError_t e;
     switch (m->bits) {
-        case 1: e = launch_pf<1>(a, tiling, d6, s); break;
-        case 2: e = launch_pf<2>(a, tiling, d6, s); break;
-        case 3: e = launch_pf<3>(a, tiling, d6, s); break;
-        case 4: e = launch_pf<4>(a, tiling, d6, s); break;
-        case 5: e = launch_pf<5>(a, tiling, d6, s); break;
-        default: e = launch_pf<6>(a, tiling, d6, s); break;
+        case 1: e = launch_pf<1>(a, tiling, s); break;
+        case 2: e = launch_pf<2>(a, tiling, s); break;
+        case 3: e = launch_pf<3>(a, tiling, s); break;
+        case 4: e = launch_pf<4>(a, tiling, s); break;
+        case 5: e = launch_pf<5>(a, tiling, s); break;
+        default: e = launch_pf<6>(a, tiling, s); break;
     }
     return tq::check(e, "tq_gemm launch");
-}
-
-// ---- the dense path (TQ_GEMM_DENSE=1): x rounded to fp16 with one power-of-two scale for the whole call, V decoded
-// exactly to fp16 in chunks of output rows, cuBLAS (fp16 inputs, fp32 accumulation). The scale 2^-e is applied as
-// cuBLAS's alpha (device pointer), so without an output Hadamard or post vector cuBLAS writes `out` directly; with
-// them, each chunk goes through an fp32 buffer and an epilogue kernel.
-
-constexpr size_t CHUNK_BYTES = 16u << 20;  // V chunk in fp16: about 16 MB (stays in L2 on most cards)
-
-int chunk_rows(int K, int N) {
-    int nc = static_cast<int>(CHUNK_BYTES / (2 * (size_t)K)) / 128 * 128;
-    if (nc < 128) nc = 128;
-    return nc < N ? nc : N;
-}
-
-struct DenseLayout {
-    size_t meta, xh, v, tmp, total;
-};
-
-DenseLayout dense_layout(int K, int N, int rows) {
-    const int nc = chunk_rows(K, N);
-    DenseLayout l;
-    l.meta = 0;  // [0] max |x s16| as uint bits, [1] alpha = 2^-e, [2] beta = 0
-    l.xh = 256;
-    l.v = l.xh + align256((size_t)rows * K * 2);
-    l.tmp = l.v + align256((size_t)nc * K * 2);
-    l.total = l.tmp + align256((size_t)rows * nc * 4);
-    return l;
-}
-
-// x_rot of one (row, 128 inputs), held by a warp (lane l: entries l + 32 i): pre, the optional 128-point Hadamard, s16
-template <typename T>
-__device__ __forceinline__ void act_block(const T* __restrict__ x, int64_t xs, int t, int k0, const float* pre, int had,
-                                          const __half* __restrict__ s16, int lane, float (&v)[4]) {
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const int k = k0 + lane + 32 * i;
-        v[i] = tq::to_f32<T>(x[t * xs + k]);
-        if (pre != nullptr) v[i] *= pre[k];
-    }
-    if (had) {
-        tq::hadamard128(v, lane);
-#pragma unroll
-        for (int i = 0; i < 4; ++i) v[i] *= 0.08838834764831845f;
-    }
-    if (s16 != nullptr)
-#pragma unroll
-        for (int i = 0; i < 4; ++i) v[i] *= __half2float(s16[(k0 + lane + 32 * i) / 16]);
-}
-
-// one warp per (row, 128 inputs): the call's max |x_rot| (uint bits, atomicMax)
-template <typename T>
-__global__ void __launch_bounds__(256) max_k(const T* __restrict__ x, int64_t xs, int rows, int K, const float* pre,
-                                             int had, const __half* __restrict__ s16, unsigned* __restrict__ meta) {
-    const int lane = threadIdx.x % 32, nb = K / 128;
-    const int64_t item = (int64_t)blockIdx.x * 8 + threadIdx.x / 32;
-    if (item >= (int64_t)rows * nb) return;
-    float v[4];
-    act_block<T>(x, xs, static_cast<int>(item / nb), static_cast<int>(item % nb) * 128, pre, had, s16, lane, v);
-    const float m = tq::warp_max(fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3]))));
-    if (lane == 0 && m > 0.f && m <= 3.0e38f) atomicMax(meta, __float_as_uint(m));
-}
-
-// the same blocks again, as fp16 x_rot 2^e (row-major rows x K), e from the call's max; alpha = 2^-e in meta[1]
-template <typename T>
-__global__ void __launch_bounds__(256) convert_k(const T* __restrict__ x, int64_t xs, int rows, int K,
-                                                 const float* pre, int had, const __half* __restrict__ s16,
-                                                 unsigned* __restrict__ meta, __half* __restrict__ xh) {
-    const float m = meta[0] != 0 ? __uint_as_float(meta[0]) : 1.f;
-    int x2 = 0;
-    frexpf(m, &x2);
-    const int e = 14 - x2;  // max |x_rot| 2^e in [2^13, 2^14)
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        reinterpret_cast<float*>(meta)[1] = ldexpf(1.f, -e);
-        reinterpret_cast<float*>(meta)[2] = 0.f;
-    }
-    const int lane = threadIdx.x % 32, nb = K / 128;
-    const int64_t item = (int64_t)blockIdx.x * 8 + threadIdx.x / 32;
-    if (item >= (int64_t)rows * nb) return;
-    const int t = static_cast<int>(item / nb), k0 = static_cast<int>(item % nb) * 128;
-    float v[4];
-    act_block<T>(x, xs, t, k0, pre, had, s16, lane, v);
-#pragma unroll
-    for (int i = 0; i < 4; ++i) xh[(int64_t)t * K + k0 + lane + 32 * i] = __float2half_rn(ldexpf(v[i], e));
-}
-
-// out[t][n0 + c] = post[n0 + c] * (H128 per 128 outputs if had) (alpha * tmp[t][c]); one warp per (row, 128 outputs)
-__global__ void epilogue_k(const float* __restrict__ tmp, int nc, int rows, const unsigned* __restrict__ meta,
-                           const float* __restrict__ post, int had, void* out, int out_type, int64_t out_stride,
-                           int n0) {
-    const int lane = threadIdx.x % 32, item = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
-    const int blocks = (nc + 127) / 128;
-    if (item >= rows * blocks) return;
-    const int t = item / blocks, c0 = (item % blocks) * 128;
-    const float alpha = reinterpret_cast<const float*>(meta)[1] * (had ? 0.08838834764831845f : 1.f);
-    float v[4];
-#pragma unroll
-    for (int m = 0; m < 4; ++m) {
-        const int c = c0 + lane + 32 * m;
-        v[m] = c < nc ? tmp[(int64_t)t * nc + c] : 0.f;
-    }
-    if (had) tq::hadamard128(v, lane);
-#pragma unroll
-    for (int m = 0; m < 4; ++m) {
-        const int c = c0 + lane + 32 * m;
-        if (c >= nc) continue;
-        store_out(out, out_type, (int64_t)t * out_stride + n0 + c, v[m] * alpha * (post != nullptr ? post[n0 + c] : 1.f));
-    }
-}
-
-std::mutex g_mutex;
-cublasHandle_t g_handles[64] = {nullptr};
-
-cublasHandle_t own_handle() {
-    int dev = 0;
-    cudaGetDevice(&dev);
-    if (dev < 0 || dev >= 64) return nullptr;
-    std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_handles[dev] == nullptr && cublasCreate(&g_handles[dev]) != CUBLAS_STATUS_SUCCESS) g_handles[dev] = nullptr;
-    return g_handles[dev];
-}
-
-int blas_fail(cublasStatus_t st, const char* what) {
-    static thread_local char msg[160];
-    snprintf(msg, sizeof(msg), "%s: cuBLAS status %d", what, static_cast<int>(st));
-    return tq::fail(TQ_E_ARG, msg);
-}
-
-int dense(const tq_matrix* m, const void* x, tq_dtype x_type, int64_t x_stride, int rows, void* out, tq_dtype out_type,
-          int64_t out_stride, const float* pre, const float* post, int flags, void* ws, size_t ws_bytes, void* cublas,
-          cudaStream_t s) {
-    const int had = (flags & TQ_HAD128_OUT) ? 1 : 0;
-    const DenseLayout l = dense_layout(m->K, m->N, rows);
-    if (ws == nullptr || ws_bytes < l.total || reinterpret_cast<uintptr_t>(ws) % 256)
-        return tq::fail(TQ_E_WORKSPACE, "tq_gemm: workspace smaller than tq_gemm_workspace_bytes (or not 256-aligned)");
-    char* w = static_cast<char*>(ws);
-    unsigned* meta = reinterpret_cast<unsigned*>(w + l.meta);
-    __half* xh = reinterpret_cast<__half*>(w + l.xh);
-    __half* vb = reinterpret_cast<__half*>(w + l.v);
-    float* tmp = reinterpret_cast<float*>(w + l.tmp);
-    const __half* s16 = static_cast<const __half*>(m->block_scale);
-    const int K = m->K, N = m->N;
-    cudaError_t ce = cudaMemsetAsync(meta, 0, 16, s);
-    if (ce != cudaSuccess) return tq::check(ce, "tq_gemm memset");
-    const int hin = (flags & TQ_HAD128_IN) ? 1 : 0;
-    const unsigned blocks = (unsigned)(((int64_t)rows * (K / 128) + 7) / 8);
-    switch (x_type) {
-        case TQ_F32:
-            max_k<float><<<blocks, 256, 0, s>>>(static_cast<const float*>(x), x_stride, rows, K, pre, hin, s16, meta);
-            convert_k<float><<<blocks, 256, 0, s>>>(static_cast<const float*>(x), x_stride, rows, K, pre, hin, s16, meta,
-                                                    xh);
-            break;
-        case TQ_BF16:
-            max_k<__nv_bfloat16><<<blocks, 256, 0, s>>>(static_cast<const __nv_bfloat16*>(x), x_stride, rows, K, pre, hin,
-                                                        s16, meta);
-            convert_k<__nv_bfloat16><<<blocks, 256, 0, s>>>(static_cast<const __nv_bfloat16*>(x), x_stride, rows, K, pre,
-                                                            hin, s16, meta, xh);
-            break;
-        default:
-            max_k<__half><<<blocks, 256, 0, s>>>(static_cast<const __half*>(x), x_stride, rows, K, pre, hin, s16, meta);
-            convert_k<__half><<<blocks, 256, 0, s>>>(static_cast<const __half*>(x), x_stride, rows, K, pre, hin, s16,
-                                                     meta, xh);
-    }
-    if ((ce = cudaGetLastError()) != cudaSuccess) return tq::check(ce, "tq_gemm convert launch");
-    cublasHandle_t h = cublas != nullptr ? static_cast<cublasHandle_t>(cublas) : own_handle();
-    if (h == nullptr) return tq::fail(TQ_E_ARG, "tq_gemm: no cuBLAS handle");
-    cudaStream_t old_stream = nullptr;
-    cublasPointerMode_t old_mode = CUBLAS_POINTER_MODE_HOST;
-    cublasGetStream(h, &old_stream);
-    cublasGetPointerMode(h, &old_mode);
-    cublasSetStream(h, s);
-    cublasSetPointerMode(h, CUBLAS_POINTER_MODE_DEVICE);
-    const float* alpha = reinterpret_cast<const float*>(meta) + 1;
-    const float* beta = reinterpret_cast<const float*>(meta) + 2;
-    const bool direct = !had && post == nullptr;
-    const cudaDataType_t ct = out_type == TQ_F32 ? CUDA_R_32F : out_type == TQ_BF16 ? CUDA_R_16BF : CUDA_R_16F;
-    const size_t es = out_type == TQ_F32 ? 4 : 2;
-    const int nc = chunk_rows(K, N);
-    int rc = 0;
-    for (int n0 = 0; n0 < N && rc == 0; n0 += nc) {
-        const int cur = N - n0 < nc ? N - n0 : nc;
-        if ((rc = tq_decode(m, TQ_V, n0, cur, vb, TQ_F16, K, s))) break;
-        // column-major view: C (cur x rows) = V_chunk^T-as-stored (cur x K) * xh^T (K x rows)
-        cublasStatus_t st;
-        if (direct) {
-            st = cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, cur, rows, K, alpha, vb, CUDA_R_16F, K, xh, CUDA_R_16F, K,
-                              beta, static_cast<char*>(out) + n0 * es, ct, static_cast<int>(out_stride),
-                              CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-        } else {
-            // the epilogue applies alpha: cuBLAS computes the unscaled product into tmp (alpha = 1 from a constant)
-            static const float h_one = 1.f, h_zero = 0.f;
-            cublasSetPointerMode(h, CUBLAS_POINTER_MODE_HOST);
-            st = cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, cur, rows, K, &h_one, vb, CUDA_R_16F, K, xh, CUDA_R_16F, K,
-                              &h_zero, tmp, CUDA_R_32F, cur, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-            cublasSetPointerMode(h, CUBLAS_POINTER_MODE_DEVICE);
-            if (st == CUBLAS_STATUS_SUCCESS) {
-                const int items = rows * ((cur + 127) / 128);
-                epilogue_k<<<(items + 7) / 8, 256, 0, s>>>(tmp, cur, rows, meta, post, had, out, out_type, out_stride,
-                                                           n0);
-                if ((ce = cudaGetLastError()) != cudaSuccess) rc = tq::check(ce, "tq_gemm epilogue launch");
-            }
-        }
-        if (st != CUBLAS_STATUS_SUCCESS) rc = blas_fail(st, "tq_gemm cublasGemmEx");
-    }
-    cublasSetPointerMode(h, old_mode);
-    cublasSetStream(h, old_stream);
-    return rc;
 }
 
 }  // namespace
@@ -725,7 +490,7 @@ int dense(const tq_matrix* m, const void* x, tq_dtype x_type, int64_t x_stride, 
 extern "C" {
 size_t tq_gemm_workspace_bytes(int K, int N, int rows) {
     if (K <= 0 || N <= 0 || K % 128 || N % 16 || rows < 1) return 0;
-    return env_dense() ? dense_layout(K, N, rows).total : fused_layout(K, N, rows).total;
+    return fused_layout(K, N, rows).total;
 }
 
 int tq_gemm(const tq_matrix* m, const void* x, tq_dtype x_type, int64_t x_stride, int rows, void* out,
@@ -736,9 +501,8 @@ int tq_gemm(const tq_matrix* m, const void* x, tq_dtype x_type, int64_t x_stride
         x_type > TQ_F16 || out_type < TQ_F32 || out_type > TQ_F16)
         return tq::fail(TQ_E_ARG, "tq_gemm: rows >= 1, x and out with strides >= K and N");
     if ((flags & TQ_HAD128_OUT) && m->N % 128) return tq::fail(TQ_E_ARG, "tq_gemm: TQ_HAD128_OUT needs N % 128 == 0");
+    (void)cublas;
     cudaStream_t s = static_cast<cudaStream_t>(stream);
-    if (env_dense()) return dense(m, x, x_type, x_stride, rows, out, out_type, out_stride, pre, post, flags, ws,
-                                  ws_bytes, cublas, s);
     return fused(m, x, x_type, x_stride, rows, out, out_type, out_stride, pre, post, flags, ws, ws_bytes, s);
 }
 }

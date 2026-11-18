@@ -86,11 +86,8 @@ int tq_repack(const void* src, int64_t src_stride_k, int64_t src_stride_n, void*
 // ws: tq_gemv_workspace_bytes(K, N, rows) bytes (256-byte aligned), uninitialized: each call zeroes the split
 // counters it uses (its first TQ_GEMV_COUNTER_BYTES) before its GEMV. One workspace of the largest size serves every
 // module, for calls ordered on one stream; concurrent calls need their own. N <= 2,097,152.
-// The 2-bit decode is the engine's version 6 (byte-permute windows) at 1-32 rows. TQ_DECODE_V4 selects version 4's
-// decode at 2 bits instead, for A/B timing only: the weights it decodes, and so the outputs, are the same.
 #define TQ_HAD128_OUT 1
 #define TQ_HAD128_IN 2
-#define TQ_DECODE_V4 4
 #define TQ_GEMV_COUNTER_BYTES 65536
 size_t tq_gemv_workspace_bytes(int K, int N, int rows);
 int tq_gemv(const tq_matrix* m, const void* x, tq_dtype x_type, int64_t x_stride, int rows, void* out,
@@ -122,11 +119,7 @@ int tq_gemv_group(int n, const tq_matrix* ms, const void* x, tq_dtype x_type, in
 // K), fp32 partials: so for one workspace that serves every module, take the largest size over the modules (k_proj's
 // can exceed gate_proj's at the same rows). The size depends on (K, N, rows) and the device's SM count. No host
 // synchronisation; capturable in CUDA graphs (as for tq_gemv, make a warm-up call before capturing: each kernel sets
-// its shared-memory attribute on its first call). cublas: unused by default.
-// For A/B timing only, TQ_GEMM_DENSE=1 in the environment (read by every tq_gemm and tq_gemm_workspace_bytes call)
-// selects the earlier path: x_rot to fp16 with one scale for the whole call, V decoded exactly to fp16 in chunks of
-// output rows, and cuBLAS (cublas: a cublasHandle_t, or null for the library's own, one per device; its stream and
-// pointer mode are set for the call and restored). Its workspace is larger: query the size under the same setting.
+// its shared-memory attribute on its first call). cublas: unused.
 size_t tq_gemm_workspace_bytes(int K, int N, int rows);
 int tq_gemm(const tq_matrix* m, const void* x, tq_dtype x_type, int64_t x_stride, int rows, void* out,
             tq_dtype out_type, int64_t out_stride, const float* pre, const float* post, int flags, void* ws,

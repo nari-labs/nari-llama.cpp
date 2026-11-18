@@ -481,23 +481,20 @@ cudaError_t launch_v(const Args& a, int cbs, cudaStream_t s) {
     return cudaGetLastError();
 }
 
+// the decode variant: version 6's, except at 2 bits and 33-64 rows (8 row groups), where version 4's is faster
 template <int K, int RM>
-cudaError_t launch_rm(const Args& a, int cbs, bool v4, cudaStream_t s) {
-    // version 6's decode, except at 2 bits and 64 rows, where version 4's measured 0.5-1.3% faster in the engine (its
-    // default_variant); TQ_DECODE_V4: version 4's at 2 bits (A/B timing)
-    if constexpr (K == 2 && RM == 8) return launch_v<K, RM, 0>(a, cbs, s);
-    else if constexpr (K == 2) return v4 ? launch_v<K, RM, 0>(a, cbs, s) : launch_v<K, RM, 1>(a, cbs, s);
-    else return (void)v4, launch_v<K, RM, 1>(a, cbs, s);
+constexpr int decode_variant() {
+    return K == 2 && RM == 8 ? 0 : 1;
 }
 
 template <int K>
-cudaError_t launch_k(const Args& a, int cbs, bool v4, cudaStream_t s) {
+cudaError_t launch_k(const Args& a, int cbs, cudaStream_t s) {
     const int groups = (a.rows + 7) / 8;
-    if (a.rows == 1 && !v4) return launch_v<K, 1, 1, true>(a, cbs, s);
-    if (groups <= 1) return launch_rm<K, 1>(a, cbs, v4, s);
-    if (groups <= 2) return launch_rm<K, 2>(a, cbs, v4, s);
-    if (groups <= 4) return launch_rm<K, 4>(a, cbs, v4, s);
-    return launch_rm<K, 8>(a, cbs, v4, s);
+    if (a.rows == 1) return launch_v<K, 1, decode_variant<K, 1>(), true>(a, cbs, s);
+    if (groups <= 1) return launch_v<K, 1, decode_variant<K, 1>()>(a, cbs, s);
+    if (groups <= 2) return launch_v<K, 2, decode_variant<K, 2>()>(a, cbs, s);
+    if (groups <= 4) return launch_v<K, 4, decode_variant<K, 4>()>(a, cbs, s);
+    return launch_v<K, 8, decode_variant<K, 8>()>(a, cbs, s);
 }
 
 template <int K, int RM, int D, bool SINGLE = false>
@@ -517,21 +514,14 @@ cudaError_t launch_multi_v(const Multi& g, int splits, cudaStream_t s) {
     return cudaGetLastError();
 }
 
-template <int K, int RM>
-cudaError_t launch_multi_rm(const Multi& g, int splits, bool v4, cudaStream_t s) {  // the variants of launch_rm
-    if constexpr (K == 2 && RM == 8) return launch_multi_v<K, RM, 0>(g, splits, s);
-    else if constexpr (K == 2) return v4 ? launch_multi_v<K, RM, 0>(g, splits, s) : launch_multi_v<K, RM, 1>(g, splits, s);
-    else return (void)v4, launch_multi_v<K, RM, 1>(g, splits, s);
-}
-
 template <int K>
-cudaError_t launch_multi_k(const Multi& g, int rows, int splits, bool v4, cudaStream_t s) {
+cudaError_t launch_multi_k(const Multi& g, int rows, int splits, cudaStream_t s) {
     const int groups = (rows + 7) / 8;
-    if (rows == 1 && !v4) return launch_multi_v<K, 1, 1, true>(g, splits, s);
-    if (groups <= 1) return launch_multi_rm<K, 1>(g, splits, v4, s);
-    if (groups <= 2) return launch_multi_rm<K, 2>(g, splits, v4, s);
-    if (groups <= 4) return launch_multi_rm<K, 4>(g, splits, v4, s);
-    return launch_multi_rm<K, 8>(g, splits, v4, s);
+    if (rows == 1) return launch_multi_v<K, 1, decode_variant<K, 1>(), true>(g, splits, s);
+    if (groups <= 1) return launch_multi_v<K, 1, decode_variant<K, 1>()>(g, splits, s);
+    if (groups <= 2) return launch_multi_v<K, 2, decode_variant<K, 2>()>(g, splits, s);
+    if (groups <= 4) return launch_multi_v<K, 4, decode_variant<K, 4>()>(g, splits, s);
+    return launch_multi_v<K, 8, decode_variant<K, 8>()>(g, splits, s);
 }
 
 // a group's workspace: the counters, then each member's activations, scales and partials (tq_gemv's layout)
@@ -612,15 +602,14 @@ int tq_gemv(const tq_matrix* m, const void* x, tq_dtype x_type, int64_t x_stride
     a.counters = counters;
     a.out = out, a.out_type = out_type, a.out_stride = out_stride;
     a.post = post, a.had = (flags & TQ_HAD128_OUT) ? 1 : 0, a.mult = m->mult;
-    const bool v4 = (flags & TQ_DECODE_V4) != 0;
     cudaError_t e;
     switch (m->bits) {
-        case 1: e = launch_k<1>(a, cbs, v4, s); break;
-        case 2: e = launch_k<2>(a, cbs, v4, s); break;
-        case 3: e = launch_k<3>(a, cbs, v4, s); break;
-        case 4: e = launch_k<4>(a, cbs, v4, s); break;
-        case 5: e = launch_k<5>(a, cbs, v4, s); break;
-        default: e = launch_k<6>(a, cbs, v4, s); break;
+        case 1: e = launch_k<1>(a, cbs, s); break;
+        case 2: e = launch_k<2>(a, cbs, s); break;
+        case 3: e = launch_k<3>(a, cbs, s); break;
+        case 4: e = launch_k<4>(a, cbs, s); break;
+        case 5: e = launch_k<5>(a, cbs, s); break;
+        default: e = launch_k<6>(a, cbs, s); break;
     }
     return tq::check(e, "tq_gemv launch");
 }
@@ -689,7 +678,7 @@ int tq_gemv_group(int n, const tq_matrix* ms, const void* x, tq_dtype x_type, in
                                                                   counters, total_cbs);
     }
     if (cudaError_t e = cudaGetLastError()) return tq::check(e, "tq_gemv_group prepare launch");
-    // one GEMV launch per (width, decode variant), the members in their order; counters at each member's offset
+    // one GEMV launch per width, the members in their order; counters at each member's offset
     Args a[MAX_GROUP];
     int gcb[MAX_GROUP];
     for (int i = 0, cum = 0; i < n; ++i) {
@@ -710,12 +699,9 @@ int tq_gemv_group(int n, const tq_matrix* ms, const void* x, tq_dtype x_type, in
         cum += gcb[i];
     }
     // a single row with several widths: one launch for every member
-    bool mixed = false, v4_any = false;
-    for (int i = 0; i < n; ++i) {
-        mixed |= ms[i].bits != ms[0].bits;
-        v4_any |= flags != nullptr && (flags[i] & TQ_DECODE_V4);
-    }
-    if (rows == 1 && mixed && !v4_any) {
+    bool mixed = false;
+    for (int i = 0; i < n; ++i) mixed |= ms[i].bits != ms[0].bits;
+    if (rows == 1 && mixed) {
         constexpr int smem_bytes[] = {0, Occ<1, 1, true>::SMEM, Occ<2, 1, true>::SMEM, Occ<3, 1, true>::SMEM,
                                       Occ<4, 1, true>::SMEM, Occ<5, 1, true>::SMEM, Occ<6, 1, true>::SMEM};
         static_assert(Occ<6, 1, true>::SMEM <= 49152, "no shared memory opt-in for the mixed launch");
@@ -734,12 +720,10 @@ int tq_gemv_group(int n, const tq_matrix* ms, const void* x, tq_dtype x_type, in
     bool done[MAX_GROUP] = {false};
     for (int i = 0; i < n; ++i) {
         if (done[i]) continue;
-        const bool v4 = flags != nullptr && (flags[i] & TQ_DECODE_V4);
         Multi g{};
         int splits = 0;
         for (int j = i; j < n; ++j) {
-            const bool v4j = flags != nullptr && (flags[j] & TQ_DECODE_V4);
-            if (done[j] || ms[j].bits != ms[i].bits || (ms[i].bits == 2 && v4j != v4)) continue;
+            if (done[j] || ms[j].bits != ms[i].bits) continue;
             done[j] = true;
             g.a[g.n++] = a[j];
         }
@@ -752,12 +736,12 @@ int tq_gemv_group(int n, const tq_matrix* ms, const void* x, tq_dtype x_type, in
         }
         cudaError_t e;
         switch (ms[i].bits) {
-            case 1: e = launch_multi_k<1>(g, rows, splits, v4, s); break;
-            case 2: e = launch_multi_k<2>(g, rows, splits, v4, s); break;
-            case 3: e = launch_multi_k<3>(g, rows, splits, v4, s); break;
-            case 4: e = launch_multi_k<4>(g, rows, splits, v4, s); break;
-            case 5: e = launch_multi_k<5>(g, rows, splits, v4, s); break;
-            default: e = launch_multi_k<6>(g, rows, splits, v4, s); break;
+            case 1: e = launch_multi_k<1>(g, rows, splits, s); break;
+            case 2: e = launch_multi_k<2>(g, rows, splits, s); break;
+            case 3: e = launch_multi_k<3>(g, rows, splits, s); break;
+            case 4: e = launch_multi_k<4>(g, rows, splits, s); break;
+            case 5: e = launch_multi_k<5>(g, rows, splits, s); break;
+            default: e = launch_multi_k<6>(g, rows, splits, s); break;
         }
         if (e != cudaSuccess) return tq::check(e, "tq_gemv_group launch");
     }

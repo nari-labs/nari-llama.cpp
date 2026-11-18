@@ -8,8 +8,6 @@
 #include "unary.cuh"
 
 #include <cmath>
-#include <set>
-#include <string>
 
 #define TRELLIS_CHECK(call)                                                                   \
     do {                                                                                      \
@@ -204,18 +202,9 @@ static bool trellis_groupable(const ggml_tensor * t) {
     return o.pin == nullptr && (o.cols_kind == 0 || o.in_fused()) && o.T <= 64;
 }
 
-// GGML_CUDA_TRELLIS_GROUP=0: every coded linear on its own, no input groups and no MLP chains (for A/B checks)
-static bool trellis_grouping() {
-    static const bool grouped = [] {
-        const char * env = getenv("GGML_CUDA_TRELLIS_GROUP");
-        return env == nullptr || atoi(env) != 0;
-    }();
-    return grouped;
-}
-
 int ggml_cuda_trellis_group_size(const ggml_cgraph * cgraph, int i) {
     const ggml_tensor * a = cgraph->nodes[i];
-    if (!trellis_grouping() || !trellis_groupable(a)) {
+    if (!trellis_groupable(a)) {
         return 1;
     }
     int n = 1;
@@ -396,56 +385,40 @@ static __global__ void trellis_swiglu_rht(const float * __restrict__ g, const fl
     }
 }
 
-// GGML_CUDA_TRELLIS_DEBUG=1: why a candidate MLP chain was not fused (each reason once)
-static int trellis_chain_reject(const char * why) {
-    static const bool debug = [] {
-        const char * env = getenv("GGML_CUDA_TRELLIS_DEBUG");
-        return env != nullptr && atoi(env) != 0;
-    }();
-    if (debug) {
-        static std::set<std::string> seen;
-        if (seen.insert(why).second) {
-            fprintf(stdout, "trellis: MLP chain not fused: %s\n", why);  // stdout: apart from the logs
-            fflush(stdout);
-        }
-    }
-    return 0;
-}
-
 int ggml_cuda_trellis_mlp_chain(const ggml_cgraph * cgraph, int i) {
-    if (!trellis_grouping() || i + 3 >= cgraph->n_nodes || ggml_cuda_trellis_group_size(cgraph, i) != 2) {
+    if (i + 3 >= cgraph->n_nodes || ggml_cuda_trellis_group_size(cgraph, i) != 2) {
         return 0;
     }
     const ggml_tensor * glu = cgraph->nodes[i + 2];
     const ggml_tensor * down = cgraph->nodes[i + 3];
     if (glu->op != GGML_OP_GLU) {
-        return trellis_chain_reject(ggml_op_name(glu->op));  // the next node after an input group of two
+        return 0;
     }
     if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0 || glu->src[1] == nullptr ||
         glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu)) {
-        return trellis_chain_reject("not a split swiglu");
+        return 0;
     }
     const ggml_tensor * gate = glu->src[0];
     const ggml_tensor * up = glu->src[1];
     const ggml_tensor * a = cgraph->nodes[i];
     const ggml_tensor * b = cgraph->nodes[i + 1];
     if (!((gate == a && up == b) || (gate == b && up == a))) {
-        return trellis_chain_reject("the swiglu reads other tensors");
+        return 0;
     }
     if (down->op != GGML_OP_TRELLIS || down->src[1] != glu || !ggml_cuda_trellis_supported(down)) {
-        return trellis_chain_reject("the node after the swiglu is not its coded down");
+        return 0;
     }
     const trellis_op og(gate), ou(up), od(down);
     const int blk = og.rows_block;
     if (og.rows_kind != 1 || ou.rows_kind != 1 || ou.rows_block != blk || og.pout != nullptr || ou.pout != nullptr ||
         od.cols_kind != 1 || od.cols_block != blk || od.pin != nullptr || blk < 256 || blk > 4096 ||
         og.N != ou.N || od.K != og.N || og.N % blk != 0 || od.T != og.T) {
-        return trellis_chain_reject("sides or shapes");
+        return 0;
     }
     const ggml_op ops[4] = {GGML_OP_TRELLIS, GGML_OP_TRELLIS, GGML_OP_GLU, GGML_OP_TRELLIS};
     const int outputs[1] = {i + 3};
     if (!ggml_can_fuse_subgraph(cgraph, i, 4, ops, outputs, 1)) {
-        return trellis_chain_reject("up, gate or the swiglu is read elsewhere");
+        return 0;
     }
     // No memory-range check: the chain reads and writes in the unfused order (x by the group; gate's and up's dst,
     // written raw, by the chain kernel into a pool buffer; that buffer by down, which writes its dst last), so down's

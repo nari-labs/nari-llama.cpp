@@ -4,13 +4,12 @@
 // in fp32, then one multiply by fp32(p^-1/2)), so tq_rht is bit-exact against trellis.fwht / trellis.rht: a warp holds
 // a chunk of 32 E entries (lane l, register e: entry l + 32 e) and runs the stages h < 32 by shuffles and h = 32 ..
 // 16 E in registers. Blocks (and runs) of up to 128 entries: one warp per block. From 256: one CTA per block, its
-// block / (32 E) warps continuing in shared memory (h = 32 E, 64 E, ...). E is 4 by default (TQ_ROT_E = 4 / 8 / 16 / 32
-// in the environment overrides it, for benchmarks), at least block / 1024 (at most 32 warps). The H_m step of
+// block / (32 E) warps continuing in shared memory (h = 32 E, 64 E, ...). E is 4, or at least block / 1024 (at most
+// 32 warps). The H_m step of
 // tq_hadfull computes c_m * sum_b (+-y_b) per output; the reference uses a BLAS product of +-c_m, so the two agree to
 // within a few ulps (exactly when m = 1, where there is no H_m step).
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 
 #include "common.cuh"
 
@@ -351,15 +350,10 @@ cudaError_t set_smem(int bytes) {
     return e;
 }
 
-// entries per lane for a block (or run) of 256 or more: TQ_ROT_E or 4, at most 32 warps (16 for hadfull runs at
-// E >= 16), at most block / 32
+// entries per lane for a block (or run) of 256 or more: 4, at most 32 warps (16 for hadfull runs at E >= 16), at
+// most block / 32
 int rot_e(int block, bool runs = false) {
-    static const int env = [] {
-        const char* v = std::getenv("TQ_ROT_E");
-        const int e = v != nullptr ? std::atoi(v) : 0;
-        return e == 4 || e == 8 || e == 16 || e == 32 ? e : 4;
-    }();
-    int e = env;
+    int e = 4;
     while (e < 32 && block / (32 * e) > (runs && e >= 16 ? 16 : 32)) e *= 2;
     while (32 * e > block) e /= 2;
     return e;
