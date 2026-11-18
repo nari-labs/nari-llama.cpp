@@ -4282,6 +4282,26 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return true;
     }
 
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_UNARY && ops.begin()[2] == GGML_OP_MUL
+     && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SOFTPLUS) {
+        const ggml_tensor * add   = cgraph->nodes[node_idx];
+        const ggml_tensor * unary = cgraph->nodes[node_idx+1];
+        const ggml_tensor * mul   = cgraph->nodes[node_idx+2];
+
+        if (ggml_get_unary_op(unary) != GGML_UNARY_OP_SOFTPLUS || unary->src[0] != add) {
+            return false;
+        }
+        const ggml_tensor * other = (mul->src[0] == unary) ? mul->src[1] : mul->src[0];
+        // the fused kernel reads its three inputs densely and does not broadcast
+        const ggml_tensor * const dense[] = { add->src[0], add->src[1], other, mul };
+        for (const ggml_tensor * t : dense) {
+            if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || !ggml_are_same_shape(t, add)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_SQR
      && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_RELU) {
         const ggml_tensor * unary = cgraph->nodes[node_idx];
@@ -5213,6 +5233,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
         ggml_cuda_op_ssm_conv(*cuda_ctx, node, /*bias_add_node=*/ nullptr, cgraph->nodes[i + 1]);
         return 1;
+    }
+
+    // softplus(x + b) * g (a delta-net gate); measured for single-token decode of models with coded linears only
+    if (node->op == GGML_OP_ADD && cuda_ctx->graph_has_trellis_op &&
+        ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
+        ggml_cuda_op_add_softplus_mul(*cuda_ctx, node, cgraph->nodes[i + 2]);
+        return 2;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||

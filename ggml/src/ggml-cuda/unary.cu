@@ -761,6 +761,32 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
     }
 }
 
+/* fused add + softplus + mul: dst = softplus(x + b) * g, the same float operations as the three ops one after another */
+
+static __global__ void add_softplus_mul_kernel(const float * x, const float * b, const float * g, float * dst, const int64_t k) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    dst[i] = op_softplus(x[i] + b[i]) * g[i];
+}
+
+void ggml_cuda_op_add_softplus_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add_node, ggml_tensor * mul_node) {
+    const ggml_tensor * unary = mul_node->src[0]->op == GGML_OP_UNARY ? mul_node->src[0] : mul_node->src[1];
+    const ggml_tensor * other = mul_node->src[0] == unary ? mul_node->src[1] : mul_node->src[0];
+    GGML_ASSERT(unary->src[0] == add_node);
+
+    const int64_t k = ggml_nelements(mul_node);
+    const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(add_softplus_mul_kernel, launch_params, (const float *) add_node->src[0]->data,
+                            (const float *) add_node->src[1]->data, (const float *) other->data, (float *) mul_node->data, k);
+}
+
 /* fused relu + sqr */
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node) {

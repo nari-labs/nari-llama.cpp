@@ -2877,6 +2877,10 @@ struct test_trellis_group : public test_case {
         for (int i = 1; i < 6; ++i) {
             out = ggml_concat(ctx, out, m[i], 0);
         }
+        // a delta-net gate on the last member, softplus(alpha + dt) * a
+        ggml_tensor * dt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m[5]->ne[0], t);
+        ggml_tensor * a  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m[5]->ne[0], t);
+        out = ggml_concat(ctx, out, ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, m[5], dt)), a), 0);
         ggml_set_name(out, "out");
 
         return out;
