@@ -1684,9 +1684,25 @@ ggml_tensor * llm_graph_context::build_rope_indexer(ggml_tensor * cur, ggml_tens
 // then each vocabulary row picked from its band (logits[t] = banded[vocab_gather[t]])
 ggml_tensor * llm_graph_context::build_trellis_bands(ggml_tensor * cur) const {
     ggml_tensor * banded = nullptr;
-    for (ggml_tensor * w : model.trellis.bands) {
-        ggml_tensor * y = build_lora_mm(w, cur);
-        banded = banded ? ggml_concat(ctx0, banded, y, 0) : y;
+    if (ggml_nrows(cur) == 1) {
+        // one token: concatenate pairwise, so each band is copied log2(n_bands) times instead of up to n_bands times
+        std::vector<ggml_tensor *> level;
+        for (ggml_tensor * w : model.trellis.bands) {
+            level.push_back(build_lora_mm(w, cur));
+        }
+        while (level.size() > 1) {
+            size_t n = 0;
+            for (size_t i = 0; i < level.size(); i += 2) {
+                level[n++] = i + 1 < level.size() ? ggml_concat(ctx0, level[i], level[i + 1], 0) : level[i];
+            }
+            level.resize(n);
+        }
+        banded = level.front();
+    } else {
+        for (ggml_tensor * w : model.trellis.bands) {
+            ggml_tensor * y = build_lora_mm(w, cur);
+            banded = banded ? ggml_concat(ctx0, banded, y, 0) : y;
+        }
     }
     if (banded->ne[1] == 1) {  // one token: the transposes are reshapes
         ggml_tensor * bt = ggml_reshape_2d(ctx0, banded, 1, banded->ne[0]);
