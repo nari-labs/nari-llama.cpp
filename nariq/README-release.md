@@ -14,10 +14,11 @@ Ollama and LM Studio cannot load those files.
 - Without a GPU, the CPU backend runs, with the best variant for the processor chosen at start.
 
 ```bash
-./llama-server -m Qwen3.8-27B-NariQ-3.0bpw.gguf --mmproj Qwen3.8-27B-NariQ-mmproj-BF16.gguf
+./llama-server -m Qwen3.8-27B-NariQ-3.0bpw.gguf --mmproj Qwen3.8-27B-NariQ-mmproj-BF16.gguf --port 8080
 ```
 
-This opens a chat page and an OpenAI-compatible API at http://127.0.0.1:8080. Without `-c`, the context is the longest
+This opens a chat page and an OpenAI-compatible API at http://127.0.0.1:8080 (without `--port`, llama-server's
+default is 9931). Without `-c`, the context is the longest
 that free GPU memory holds, up to 262,144 tokens.
 
 `build-info.json` gives the source revision and hashes. The llama.cpp parts are under
