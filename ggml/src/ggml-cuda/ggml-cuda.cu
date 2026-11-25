@@ -1230,7 +1230,10 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
     int64_t ne0 = tensor->ne[0];
 
     // [TAG_ALLOC_SIZE_EXPAND]
-    if (ggml_is_quantized(tensor->type)) {
+    // trellis fork: a coded weight is output-tile-major, not row-major (nariq/FORMAT.md). Row padding
+    // would append bytes no reader interprets, and the zero-fill of that padding is the first async
+    // operation on the per-thread stream during weight upload. Coded tensors are allocated exactly.
+    if (ggml_is_quantized(tensor->type) && !ggml_is_trellis_type(tensor->type)) {
         if (ne0 % MATRIX_ROW_PADDING != 0) {
             GGML_ASSERT(tensor->nb[0] == ggml_element_size(tensor));
             size += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
@@ -6364,8 +6367,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return false;
             }
         case GGML_OP_TRELLIS:
-            // trellis fork: libtrellis's GEMV / GEMM need sm_80+ (the loader probes this op for a coded weight)
-            return ggml_cuda_trellis_supported(op) && ggml_cuda_info().devices[dev_ctx->device].cc >= GGML_CUDA_CC_AMPERE;
+            // trellis fork: libtrellis's GEMV / GEMM need sm_80+; HIP kernels require wave32 (RDNA)
+            return ggml_cuda_trellis_supported(op) &&
+                   ggml_cuda_info().devices[dev_ctx->device].cc >= GGML_CUDA_CC_AMPERE &&
+                   ggml_cuda_info().devices[dev_ctx->device].warp_size == 32;
         case GGML_OP_TRELLIS_GET_ROWS:
             return false; // trellis fork: the coded embedding stays in host memory (CPU op)
         case GGML_OP_MUL_MAT:
