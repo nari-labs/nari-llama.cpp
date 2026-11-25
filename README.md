@@ -115,9 +115,10 @@ docker run --rm --gpus all -p 127.0.0.1:8080:8080 -v "$PWD:/models:ro" ghcr.io/n
 | NVIDIA GeForce | One card run so far, not qualified: RTX 5060 Ti 16 GB, 2.5bpw with the vision projector, about 38 tokens/s decode on Windows (512 tokens, short prompt). |
 | NVIDIA, Linux ARM64 (GH200, DGX Spark) | No release binaries; build from source, untested. |
 | Apple Silicon | Experimental, build from source, about 3.8 (3.0bpw) to 4.9 (2.0bpw) tokens/s on an M3 Pro ([Metal notes](nariq/README-metal.md)). |
+| AMD RDNA4, Linux (ROCm) | Experimental, build from source, one card run so far: RX 9070 XT 16 GB, 3.0bpw, about 225 tokens/s prompt (WMMA) and 16 tokens/s decode, full offload up to about 83K context ([HIP notes](nariq/README-hip.md)). On AVX-512 hosts ROCm 10.1 needs the object-alignment workaround described there. |
 | CPU | Every coded operation runs on the CPU, slowly for a 27B model. |
 | AMD GPUs, Linux (ROCm) | Experimental source build for the RX 7900 XTX and RX 9070 XT. GPU validation is pending. [Use the `nariq/experimental-amd` branch](https://github.com/nari-labs/nari-llama.cpp/tree/nariq/experimental-amd). |
-| Other AMD GPUs, Intel GPUs | NariQ coded operations run on the CPU. |
+| Other AMD RDNA3 and older, Intel GPUs | NariQ coded operations run on the CPU. |
 
 Kernel tuning has focused on the RTX PRO 6000; on other GPUs NariQ files are slower than comparable stock GGUFs for
 now. Coded embedding lookups run on the CPU. LoRA adapters on NariQ weights are rejected.

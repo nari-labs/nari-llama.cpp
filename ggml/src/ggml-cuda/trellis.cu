@@ -555,6 +555,11 @@ void ggml_cuda_op_trellis_mlp_chain(ggml_backend_cuda_context & ctx, ggml_tensor
     trellis_product(ctx, od, xd.ptr, n, nullptr, 0, (float *) down->data);
 }
 
+#elif defined(GGML_USE_HIP)
+
+// trellis fork: HIP has its own kernels (scalar GEMV decode, WMMA prefill; no libtrellis)
+#include "trellis-hip.cuh"
+
 #else
 
 bool ggml_cuda_trellis_supported(const ggml_tensor * op) {
