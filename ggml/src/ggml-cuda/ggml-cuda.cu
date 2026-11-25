@@ -1230,7 +1230,10 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
     int64_t ne0 = tensor->ne[0];
 
     // [TAG_ALLOC_SIZE_EXPAND]
-    if (ggml_is_quantized(tensor->type)) {
+    // trellis fork: a coded weight is output-tile-major, not row-major (nariq/FORMAT.md). Row padding
+    // would append bytes no reader interprets, and the zero-fill of that padding is the first async
+    // operation on the per-thread stream during weight upload. Coded tensors are allocated exactly.
+    if (ggml_is_quantized(tensor->type) && !ggml_is_trellis_type(tensor->type)) {
         if (ne0 % MATRIX_ROW_PADDING != 0) {
             GGML_ASSERT(tensor->nb[0] == ggml_element_size(tensor));
             size += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
