@@ -557,6 +557,11 @@ void ggml_cuda_op_trellis_mlp_chain(ggml_backend_cuda_context & ctx, ggml_tensor
 
 #else
 
+#ifdef GGML_USE_HIP
+#include <cmath>
+#include "trellis-hip.cuh"
+#else
+
 bool ggml_cuda_trellis_supported(const ggml_tensor * op) {
     GGML_UNUSED(op);
     return false;
@@ -567,6 +572,8 @@ void ggml_cuda_op_trellis(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_UNUSED(dst);
     GGML_ABORT("trellis: this build has no libtrellis (configure with -DGGML_CUDA_TRELLIS_DIR=<libtrellis folder>)");
 }
+
+#endif // GGML_USE_HIP
 
 int ggml_cuda_trellis_group_size(const ggml_cgraph * cgraph, int i) {
     GGML_UNUSED(cgraph);
