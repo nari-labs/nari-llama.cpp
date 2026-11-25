@@ -279,6 +279,41 @@ static bool trellis_groupable(const ggml_tensor * t) {
     return o.pin == nullptr && (o.cols_kind == 0 || o.in_fused()) && o.T <= 64;
 }
 
+// the MLP chain needs the same properties, minus the column cap: its products are plain GEMMs for any row count
+static bool trellis_chainable(const ggml_tensor * t) {
+    if (t->op != GGML_OP_TRELLIS || (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || !ggml_cuda_trellis_supported(t)) {
+        return false;
+    }
+    const trellis_op o(t);
+    return o.pin == nullptr && (o.cols_kind == 0 || o.in_fused());
+}
+
+// gate and up of one MLP for the chain: both coded linears over one x of one K (the group test without the row cap)
+static bool trellis_chain_pair(const ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * a = cgraph->nodes[i];
+    const ggml_tensor * b = i + 1 < cgraph->n_nodes ? cgraph->nodes[i + 1] : nullptr;
+    return b != nullptr && trellis_chainable(a) && trellis_chainable(b) && b->src[1] == a->src[1] &&
+           b->src[0]->ne[0] == a->src[0]->ne[0];
+}
+
+// the raw product of one member (no output side, no gather): the chain applies the rotations itself
+static void trellis_product_raw(ggml_backend_cuda_context & ctx, const trellis_op & o, const float * gpre, int flags,
+                                float * dst) {
+    const int K = o.K, N = o.N;
+    const int64_t T = o.T;
+    cudaStream_t stream = ctx.stream();
+    const tq_matrix m = o.matrix();
+    GGML_ASSERT(o.pout == nullptr && T > 64);
+    if (o.out_fused()) {
+        flags |= TQ_HAD128_OUT;
+    }
+    const size_t wsb = tq_gemm_workspace_bytes(K, N, (int) T);
+    ggml_cuda_pool_alloc<char> wbuf(ctx.pool(), wsb + 256);
+    char * ws = trellis_align256(wbuf.ptr);
+    TRELLIS_CHECK(tq_gemm(&m, (const float *) o.x->data, TQ_F32, o.x->nb[1] / sizeof(float), (int) T, dst, TQ_F32, N,
+                          gpre, nullptr, flags, ws, wsb, stream));
+}
+
 int ggml_cuda_trellis_group_size(const ggml_cgraph * cgraph, int i) {
     const ggml_tensor * a = cgraph->nodes[i];
     if (!trellis_groupable(a)) {
@@ -497,7 +532,10 @@ static __global__ void trellis_swiglu_rht(const float * __restrict__ g, const fl
 }
 
 int ggml_cuda_trellis_mlp_chain(const ggml_cgraph * cgraph, int i) {
-    if (i + 3 >= cgraph->n_nodes || ggml_cuda_trellis_group_size(cgraph, i) != 2) {
+    if (i + 3 >= cgraph->n_nodes) {
+        return 0;
+    }
+    if (ggml_cuda_trellis_group_size(cgraph, i) != 2 && !trellis_chain_pair(cgraph, i)) {
         return 0;
     }
     const ggml_tensor * glu = cgraph->nodes[i + 2];
@@ -545,7 +583,15 @@ void ggml_cuda_op_trellis_mlp_chain(ggml_backend_cuda_context & ctx, ggml_tensor
     const int blk = og.rows_block, n = og.N;
     const int64_t T = og.T;
     ggml_cuda_pool_alloc<float> xd(ctx.pool(), (size_t) n * T);
-    trellis_group(ctx, nodes, 2, false);  // the raw products into gate's and up's dst
+    if (T <= 64) {
+        trellis_group(ctx, nodes, 2, false);  // the raw products into gate's and up's dst
+    } else {
+        for (int j = 0; j < 2; ++j) {
+            const trellis_op oj(nodes[j]);
+            trellis_product_raw(ctx, oj, oj.in_fused() ? (const float *) oj.pre->data : nullptr,
+                                oj.in_fused() ? TQ_HAD128_IN : 0, (float *) nodes[j]->data);
+        }
+    }
     const float c = (float) std::pow((double) blk, -0.5);
     constexpr int E = 4;  // 256-4096 entries: 2-32 warps
     trellis_swiglu_rht<E><<<dim3(n / blk, (unsigned) T), blk / E, 2 * blk * sizeof(float), stream>>>(
