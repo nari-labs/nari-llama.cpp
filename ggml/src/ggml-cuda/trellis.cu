@@ -496,7 +496,8 @@ static __global__ void trellis_swiglu_rht(const float * __restrict__ g, const fl
     }
 }
 
-int ggml_cuda_trellis_mlp_chain(const ggml_cgraph * cgraph, int i) {
+int ggml_cuda_trellis_mlp_chain(const ggml_cgraph * cgraph, int i, int device) {
+    GGML_UNUSED(device);
     if (i + 3 >= cgraph->n_nodes || ggml_cuda_trellis_group_size(cgraph, i) != 2) {
         return 0;
     }
@@ -557,8 +558,8 @@ void ggml_cuda_op_trellis_mlp_chain(ggml_backend_cuda_context & ctx, ggml_tensor
 
 #else
 
-#ifdef GGML_USE_HIP
-#include <cmath>
+#if defined(GGML_USE_HIP) && defined(__linux__)
+#include "trellis-hip-rdna4.cuh"
 #include "trellis-hip.cuh"
 #else
 
@@ -573,7 +574,7 @@ void ggml_cuda_op_trellis(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ABORT("trellis: this build has no libtrellis (configure with -DGGML_CUDA_TRELLIS_DIR=<libtrellis folder>)");
 }
 
-#endif // GGML_USE_HIP
+#endif // defined(GGML_USE_HIP) && defined(__linux__)
 
 int ggml_cuda_trellis_group_size(const ggml_cgraph * cgraph, int i) {
     GGML_UNUSED(cgraph);
@@ -588,16 +589,27 @@ void ggml_cuda_op_trellis_group(ggml_backend_cuda_context & ctx, ggml_tensor * c
     GGML_ABORT("trellis: this build has no libtrellis");
 }
 
-int ggml_cuda_trellis_mlp_chain(const ggml_cgraph * cgraph, int i) {
+int ggml_cuda_trellis_mlp_chain(const ggml_cgraph * cgraph, int i, int device) {
+#if defined(GGML_USE_HIP) && defined(__linux__)
+    if (ggml_cuda_info().devices[device].cc == GGML_TRELLIS_HIP_GFX1201) {
+        return trellis_hip_rdna4::mlp_chain_size(cgraph, i);
+    }
+#else
+    GGML_UNUSED(device);
     GGML_UNUSED(cgraph);
     GGML_UNUSED(i);
+#endif
     return 0;
 }
 
 void ggml_cuda_op_trellis_mlp_chain(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes) {
+#if defined(GGML_USE_HIP) && defined(__linux__)
+    trellis_hip_rdna4::mul_mat_mlp_chain(ctx, nodes);
+#else
     GGML_UNUSED(ctx);
     GGML_UNUSED(nodes);
     GGML_ABORT("trellis: this build has no libtrellis");
+#endif
 }
 
 #endif

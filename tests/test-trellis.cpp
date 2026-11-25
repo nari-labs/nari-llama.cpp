@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <cmath>
 #include <string>
 #include <cstdio>
@@ -100,9 +101,9 @@ static void run(ggml_backend_t backend, int bits, int mode, int columns) {
 
 
 // Device tests use backend allocations and transfers, never tensor->data for device results.
-static void run_device(ggml_backend_t backend, int bits, int mode, int columns) {
+static void run_device(ggml_backend_t backend, int bits, int mode, int columns, bool high_range = false) {
     const int K = mode == 4 ? 192 : mode == 5 ? 1088 : mode == 6 ? 384 : mode == 8 ? 272 : 256;
-    const int N = mode == 4 ? 320 : mode == 5 ? 1088 : mode == 6 ? 640 : mode == 8 ? 304 : 128;
+    const int N = mode == 4 ? 320 : mode == 5 ? 1088 : mode == 6 ? 640 : mode == 8 ? 304 : mode == 9 ? 48 : 128;
     if (verbose) {
         std::printf("%s: TRL%d mode=%d K=%d N=%d tokens=%d\n", ggml_backend_name(backend), bits, mode, K, N, columns);
     }
@@ -123,6 +124,7 @@ static void run_device(ggml_backend_t backend, int bits, int mode, int columns) 
     if (mode == 1 || mode == 2 || mode == 7) { desc[0] = desc[3] = 1; desc[1] = desc[4] = 128; }
     if (mode >= 3 && mode <= 6) { desc[0] = desc[3] = 2; }
     if (mode == 6) { desc[2] = desc[5] = 2; desc[6] = 2; desc[7] = 256; desc[8] = 384; }
+    if (mode == 10) { desc[0] = desc[3] = 2; desc[6] = 0; }
     const int nd = 7 + desc[6];
     const bool permute = mode >= 2;
     auto * y = ggml_trellis_mul_mat(ctx, w, x, scale, pre, post, permute ? pin : nullptr, permute ? pout : nullptr, desc, nd);
@@ -139,6 +141,15 @@ static void run_device(ggml_backend_t backend, int bits, int mode, int columns) 
         check(!ggml_backend_supports_op(backend, y), "Metal accepted unsupported transform");
         y->op_params[0] = kind;
     }
+    if (bits == 1 && mode == 0 && columns == 1 && std::string(ggml_backend_name(backend)).find("ROCm") == 0) {
+        const size_t stride = w->nb[1];
+        w->nb[1] += w->nb[0];
+        check(!ggml_backend_supports_op(backend, y), "ROCm accepted a strided coded weight");
+        w->nb[1] = stride;
+        w->ne[1] = 0;
+        check(!ggml_backend_supports_op(backend, y), "ROCm accepted an empty coded weight");
+        w->ne[1] = N;
+    }
     auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     check(buffer != nullptr, "device allocation failed");
     std::mt19937 rng(1234 + bits);
@@ -148,6 +159,13 @@ static void run_device(ggml_backend_t backend, int bits, int mode, int columns) 
     std::vector<ggml_fp16_t> scales(K/16);
     for (auto & v : codes) { v = rng() & 255; }
     for (auto & v : input) { v = float(int(rng()%101) - 50)/100; }
+    if (high_range) {
+        for (int c : {0, columns - 1}) {
+            float * row = input.data() + c * (K + 16);
+            std::fill_n(row, K, 0.0f);
+            row[0] = 1000000.0f;
+        }
+    }
     for (int i = 0; i < K/16; ++i) { scales[i] = ggml_fp32_to_fp16(0.1f + (i%7)*0.01f); }
     for (int i = 0; i < K; ++i) { a[i] = (i%2 ? -1.f : 1.f)*(1.f + (i%3)*0.1f); ip[i] = K - 1 - i; }
     for (int i = 0; i < N; ++i) { b[i] = 0.8f + (i%5)*0.1f; op[i] = N - 1 - i; }
@@ -175,6 +193,52 @@ static void run_device(ggml_backend_t backend, int bits, int mode, int columns) 
     }
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
+}
+
+static std::vector<float> run_mlp_chain(ggml_backend_t backend, int columns) {
+    constexpr int width = 256;
+    auto * ctx = ggml_init({1024 * 1024, nullptr, true});
+    check(ctx != nullptr, "MLP context allocation failed");
+    auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, columns);
+    auto * s16 = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, width / 16);
+    auto * pre = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
+    auto * post = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
+    auto * gate_w = ggml_new_tensor_2d(ctx, GGML_TYPE_TRL2, width, width);
+    auto * up_w = ggml_new_tensor_2d(ctx, GGML_TYPE_TRL2, width, width);
+    auto * down_w = ggml_new_tensor_2d(ctx, GGML_TYPE_TRL2, width, width);
+    const int32_t desc[] = {1, 128, 1, 1, 128, 1, 0};
+    auto * gate = ggml_trellis_mul_mat(ctx, gate_w, x, s16, pre, post, nullptr, nullptr, desc, 7);
+    auto * up = ggml_trellis_mul_mat(ctx, up_w, x, s16, pre, post, nullptr, nullptr, desc, 7);
+    auto * glu = ggml_swiglu_split(ctx, gate, up);
+    auto * down = ggml_trellis_mul_mat(ctx, down_w, glu, s16, pre, post, nullptr, nullptr, desc, 7);
+    auto * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, down);
+    auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    check(buffer != nullptr, "MLP buffer allocation failed");
+
+    std::mt19937 rng(3251);
+    std::vector<unsigned char> codes(ggml_nbytes(gate_w));
+    for (auto * w : {gate_w, up_w, down_w}) {
+        for (auto & v : codes) {
+            v = rng() & 255;
+        }
+        ggml_backend_tensor_set(w, codes.data(), 0, codes.size());
+    }
+    const std::vector<float> side(width, 0.75f);
+    const std::vector<ggml_fp16_t> scales(width / 16, ggml_fp32_to_fp16(0.005f));
+    std::vector<float> data(width * columns);
+    for (auto & v : data) {
+        v = float(int(rng() % 101) - 50) / 100.0f;
+    }
+    ggml_backend_tensor_set(s16, scales.data(), 0, ggml_nbytes(s16));
+    ggml_backend_tensor_set(pre, side.data(), 0, ggml_nbytes(pre));
+    ggml_backend_tensor_set(post, side.data(), 0, ggml_nbytes(post));
+    ggml_backend_tensor_set(x, data.data(), 0, ggml_nbytes(x));
+    check(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "MLP graph failed");
+    ggml_backend_tensor_get(down, data.data(), 0, ggml_nbytes(down));
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return data;
 }
 
 
@@ -313,6 +377,24 @@ int main(int argc, char ** argv) {
     for (int bits = 1; bits <= 6; ++bits) {
         for (int mode = 0; mode < 9; ++mode) {
             for (int columns : {1, 7, 35}) { run_device(device, bits, mode, columns); }
+        }
+    }
+    if (std::string(ggml_backend_name(device)).find("ROCm") == 0) {
+        for (int bits = 1; bits <= 6; ++bits) {
+            for (int columns : {8, 31, 32}) { run_device(device, bits, 0, columns); }
+        }
+    }
+    if (device == cpu || std::string(ggml_backend_name(device)).find("ROCm") == 0) {
+        run_device(device, 3, 0, 7, true);
+        run_device(device, 3, 9, 35, true);
+        run_device(device, 3, 0, 65, true);
+        run_device(device, 3, 10, 35);
+        for (int columns : {1, 35}) {
+            const auto expected = run_mlp_chain(cpu, columns);
+            const auto actual = run_mlp_chain(device, columns);
+            for (size_t i = 0; i < actual.size(); ++i) {
+                check_close(actual[i], expected[i]);
+            }
         }
     }
     for (bool bands : {false, true}) {

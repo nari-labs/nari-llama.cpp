@@ -1227,6 +1227,11 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
     size_t size = tensor->op == GGML_OP_FLASH_ATTN_EXT
         ? ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor)
         : ggml_nbytes(tensor);
+#if defined(GGML_USE_HIP) && defined(__linux__)
+    if (ggml_is_trellis_type(tensor->type) && ggml_cuda_info().devices[buft_ctx->device].cc == GGML_TRELLIS_HIP_GFX1201) {
+        return size; // The packed Trellis tiles have no trailing row padding.
+    }
+#endif
     int64_t ne0 = tensor->ne[0];
 
     // [TAG_ALLOC_SIZE_EXPAND]
@@ -4417,7 +4422,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     // trellis fork: an MLP's up/gate, swiglu and down as one chain; consecutive coded linears of one x as an input group
     if (node->op == GGML_OP_TRELLIS && cuda_ctx->stream_context().concurrent_events.empty()) {
-        if (ggml_cuda_trellis_mlp_chain(cgraph, i) == 4) {
+        if (ggml_cuda_trellis_mlp_chain(cgraph, i, cuda_ctx->device) == 4) {
             ggml_cuda_op_trellis_mlp_chain(*cuda_ctx, cgraph->nodes + i);
             return 3;
         }
@@ -6363,13 +6368,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 default:
                     return false;
             }
-        case GGML_OP_TRELLIS:
-            // trellis fork: libtrellis's GEMV / GEMM need sm_80+ (the loader probes this op for a coded weight)
-#if defined(GGML_USE_HIP)
-            return ggml_cuda_trellis_supported(op);
+        case GGML_OP_TRELLIS: {
+            const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
+#if defined(GGML_USE_HIP) && defined(__linux__)
+            return (cc == GGML_TRELLIS_HIP_GFX1100 || cc == GGML_TRELLIS_HIP_GFX1201) && ggml_cuda_trellis_supported(op);
 #else
-            return ggml_cuda_trellis_supported(op) && ggml_cuda_info().devices[dev_ctx->device].cc >= GGML_CUDA_CC_AMPERE;
+            // trellis fork: libtrellis's GEMV / GEMM need sm_80+ (the loader probes this op for a coded weight)
+            return ggml_cuda_trellis_supported(op) && cc >= GGML_CUDA_CC_AMPERE;
 #endif
+        }
         case GGML_OP_TRELLIS_GET_ROWS:
             return false; // trellis fork: the coded embedding stays in host memory (CPU op)
         case GGML_OP_MUL_MAT:

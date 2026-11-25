@@ -1,50 +1,43 @@
-# Build and validate NariQ on gfx1100
+# Build and validate NariQ on HIP
 
-Use a Linux ROCm 7.2.4 development environment with access to the AMD
-GPU. In a container, pass through /dev/kfd and the appropriate /dev/dri
-render device. Build from the patched NariQ tree.
+The experimental Linux backend supports coded linear layers on `gfx1100` (RX 7900 XTX) and `gfx1201` (RX 9070 XT).
+The RX 7900 XTX uses FP32 product kernels. The RX 9070 XT uses coded GEMV for decode and WMMA for prefill, with FP32 recomputation when a scaled activation exceeds the FP16 range.
+Coded embeddings and Trellis operations on other targets use the CPU.
+Use a Linux ROCm development environment with access to the GPU. In a container, pass through `/dev/kfd` and the appropriate `/dev/dri` render device.
 
 ```sh
+AMD_GPU_TARGET=gfx1100 # use gfx1201 for the RX 9070 XT
 CC=/opt/rocm/bin/amdclang CXX=/opt/rocm/bin/amdclang++ \
 cmake -G Ninja -S . -B build-hip -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang \
-  -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1100 \
+  -DGGML_HIP=ON -DAMDGPU_TARGETS="$AMD_GPU_TARGET" \
   -DLLAMA_BUILD_TESTS=ON -DLLAMA_USE_PREBUILT_UI=OFF
-cmake --build build-hip --parallel 6 --target llama-server test-trellis test-trellis-model
+cmake --build build-hip --parallel 6 --target llama-server llama-bench test-trellis test-trellis-model
 ```
 
-Obtain Qwen3.8-27B-NariQ-3.0bpw.gguf from the public Nari Labs model card
-and record its SHA-256. Start the text-only server.
+## Qualify a revision
 
-```sh
-MODEL=/path/to/Qwen3.8-27B-NariQ-3.0bpw.gguf
-build-hip/bin/llama-server -m "$MODEL" -ngl 99 --fit off \
-  --host 127.0.0.1 --port 18281 -c 262144 -np 1 -fa on \
-  -ctk q8_0 -ctv q8_0 -b 1024 -ub 1024
-```
-
-For the other cache runs, restart with q8_0/q4_0 and q4_0/q4_0. Submit
-identical token IDs via /completion with cache_prompt=false, temperature=0
-and n_predict=16. Record the actual prompt and generated token counts,
-timings, and VRAM after completion. The companion benchmark script generates
-the same prompt and prints those measurements.
-
-To run the synthetic tensor test, use `build-hip/bin/test-trellis -v ROCm0`.
+Test the same source revision on both GPU targets. Record the source revision, GPU target, ROCm version, and test output.
+Run `build-hip/bin/test-trellis -v ROCm0` (use the device name printed by the backend if the system has more than one GPU).
+This checks CPU parity for all six Trellis types and verifies that the scheduler assigns the coded heads to the requested GPU.
+On the RX 9070 XT, repeat with `GGML_TRELLIS_HIP_MM=0 GGML_CUDA_DISABLE_FUSION=1` to check the separate FP32 kernels against the same reference.
 
 ## Numerical parity procedure
 
-Use the same coded weights for the comparison. Build the F32 reference with
+Run the comparison for the released 3.0, 2.5 and 2.0 bpw GGUFs and record their SHA-256 hashes. Build the F32 reference with
 nariq/decode_reference.py, passing the ggml-base shared library from this fork
 and --outtype f32. Allow disk space for roughly 110 GB of reference weights
 and use CPU inference for the F32 reference.
 
 ```sh
 PROBE=build-hip/bin/test-trellis-model
+MODEL=/path/to/Qwen3.8-27B-NariQ-3.0bpw.gguf
+PROMPT='A person looks out over the sea at night. She takes notes on the weather and the light from the stars. She writes down the time, the place, and what she can see. What is she doing?'
 "$PROBE" --model /path/to/reference-f32.gguf --output ref \
-  --gpu-layers 0 --ubatch 8 --predict 8
-for ubatch in 8 1; do
+  --prompt "$PROMPT" --gpu-layers 0 --ubatch 8 --predict 8
+for ubatch in 1 32; do
   "$PROBE" --model "$MODEL" --output "hip-$ubatch" --force ref.json \
-    --gpu-layers 99 --ubatch "$ubatch" --predict 8
+    --prompt "$PROMPT" --gpu-layers 99 --ubatch "$ubatch" --predict 8
   python3 nariq/compare_logits.py ref "hip-$ubatch" \
     --max-kl 0.001 --min-top1 0.98 --output "hip-$ubatch-report.json"
 done
@@ -58,7 +51,27 @@ separate and validate it on CUDA hardware using the patched tree.
 Upstream qualification record
 https://github.com/nari-labs/nari-llama.cpp/blob/nariq/b12431/nariq/cuda-qualification.md
 
-## Numerical checks on the RX 7900 XTX
+## Compare performance with the original PRs
+
+Build the candidate and the original PR on the same machine with the same ROCm version, compiler flags, GPU power settings, and model file.
+Use PR #3 at `f52affb4620a51863fc7c54aebc9fbf496234b99` on the RX 7900 XTX and PR #4 at `08beda504c61e61d645008d6c86c47be4d5dfd13` on the RX 9070 XT.
+Use separate build directories and run the same commands on both binaries with default Trellis dispatch and fusion.
+
+```sh
+# RX 7900 XTX, the PR #3 batch, microbatch and KV settings
+build-hip/bin/llama-bench -m "$MODEL" -ngl 99 -p 2048 -n 32 -b 1024 -ub 1024 \
+  -fa on -ctk q8_0 -ctv q8_0 -r 5 -o json -v
+
+# RX 9070 XT, the PR #4 prompt and decode lengths
+build-hip/bin/llama-bench -m "$MODEL" -ngl 99 -p 512 -n 32 -d 0,4096 -r 5 -o json -v
+```
+
+Record prompt and decode throughput separately at 3.0, 2.5 and 2.0 bpw, along with full-offload confirmation.
+Use the per-run samples to distinguish a repeatable drop from normal timing variation. Each card's candidate results should match or exceed its own baseline in both prefill and decode.
+
+## Prior measurements on the RX 7900 XTX
+
+These measurements are from the original `gfx1100` implementation on ROCm 7.2.4.
 
 The initial HIP bulk path converted transformed activations to FP16 before GEMM.
 In the synthetic TRL1 test, the first reported mismatch at a batch of 35 was
@@ -80,6 +93,17 @@ every top-1 token and the entire greedy continuation.
 | 2.0 bpw | 32 | 1.25e-5 | 3.80e-4 |
 
 ## Performance on the RX 7900 XTX
+
+For the long-context benchmark on this 24 GiB card, start the text-only server with the 3.0 bpw model.
+
+```sh
+build-hip/bin/llama-server -m "$MODEL" -ngl 99 --fit off \
+  --host 127.0.0.1 --port 18281 -c 262144 -np 1 -fa on \
+  -ctk q8_0 -ctv q8_0 -b 1024 -ub 1024
+```
+
+Run `python3 nariq/benchmark-hip.py` to submit the fixed prompt and record actual token counts and timings.
+For the other cache runs, restart the server with q8_0/q4_0 and q4_0/q4_0.
 
 All measurements use 3.0 bpw, ROCm 7.2.4, Q8_0/Q8_0 KV, and batch and
 microbatch sizes of 1024.

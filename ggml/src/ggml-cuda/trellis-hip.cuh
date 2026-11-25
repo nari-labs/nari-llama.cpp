@@ -1,15 +1,18 @@
-#include <cstdlib>
+#include <cmath>
 
 // Reference HIP implementation of the NariQ coded linear.
 namespace {
 constexpr int threads = 128;
+constexpr int rows_per_block = threads / WARP_SIZE;
+constexpr int gemm_min_tokens = 32;
+constexpr int gemm_stripe_rows = 4096;
 
 struct side_layout {
     int width;
     int slice;
     int parts;
-    int starts[8];
-    int sizes[8];
+    int starts[GGML_TRELLIS_MAX_PARTS];
+    int sizes[GGML_TRELLIS_MAX_PARTS];
 
     __device__ int stored(int index) const {
         const int shard = index / slice;
@@ -93,8 +96,7 @@ static __device__ int decode_value(const uint32_t * tile, int r, int c) {
 template<int bits>
 static __global__ void coded_product(const uint32_t * codes, const float * x, float * y,
                                      int k, int n, size_t count) {
-    constexpr int lanes = 32;
-    constexpr int rows_per_block = threads / lanes;
+    constexpr int lanes = WARP_SIZE;
     const int lane = threadIdx.x % lanes;
     const size_t index = size_t(blockIdx.x) * rows_per_block + threadIdx.x / lanes;
     if (index >= count) return;
@@ -141,7 +143,6 @@ static void launch_product(const uint32_t * codes, const float * x, float * y,
         coded_tile_product<bits><<<((tokens + 15) / 16) * (n / 16), dim3(16, 16), 0, stream>>>(
             codes, x, y, k, n, tokens);
     } else {
-        constexpr int rows_per_block = threads / 32;
         const size_t count = tokens * n;
         coded_product<bits><<<(count + rows_per_block - 1) / rows_per_block, threads, 0, stream>>>(
             codes, x, y, k, n, count);
@@ -163,58 +164,15 @@ static __global__ void unpack_weights(const uint32_t * codes, float * out, int k
 }
 
 template<int bits>
-static __global__ void trellis_wmma(const uint32_t * codes, const float * x, float * y,
-                             int k, int n, int tokens) {
-#if defined(AMD_WMMA_256B_AVAILABLE)
-    using half16 = _Float16 __attribute__((ext_vector_type(16)));
-    using float8 = float __attribute__((ext_vector_type(8)));
-    const int lane = threadIdx.x;
-    const int index = lane % 16;
-    const int token = blockIdx.y * 16 + index;
-    const size_t row_tile = blockIdx.x;
-    float8 acc{};
-    for (int col = 0; col < k; col += 16) {
-        const auto * tile = codes + (row_tile * (k / 16) + col / 16) * 8 * bits;
-        half16 a, b;
-        #pragma unroll
-        for (int i = 0; i < 16; ++i) {
-            a[i] = _Float16(decode_value<bits>(tile, index, i));
-            b[i] = token < tokens ? _Float16(x[size_t(token) * k + col + i]) : _Float16(0);
-        }
-        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, acc);
-    }
-    if (token < tokens) {
-        #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            y[size_t(token) * n + row_tile * 16 + 2 * i + lane / 16] = acc[i];
-        }
-    }
-#else
-    GGML_UNUSED_VARS(codes, x, y, k, n, tokens);
-    NO_DEVICE_CODE;
-#endif
-}
-
-template<int bits>
 static void product(ggml_backend_cuda_context & ctx, const uint32_t * codes, const float * x,
                     float * y, int k, int n, size_t tokens) {
     const auto stream = ctx.stream();
-    if (tokens < 32) {
+    if (tokens < gemm_min_tokens) {
         launch_product<bits>(codes, x, y, k, n, tokens, stream);
         return;
     }
-    // Opt-in FP16 experiment for comparison with the default FP32 path.
-    static const bool use_wmma = [] {
-        const char * value = std::getenv("GGML_HIP_TRELLIS_WMMA");
-        return value && value[0] == '1' && value[1] == '\0';
-    }();
-    const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    if (use_wmma && GGML_CUDA_CC_IS_RDNA3_0(cc) && tokens <= 65535u * 16u) {
-        trellis_wmma<bits><<<dim3(n / 16, (tokens + 15) / 16), 32, 0, stream>>>(codes, x, y, k, n, tokens);
-        return;
-    }
     // Bound temporary memory for large output-vocabulary bands.
-    const int stripe = std::min(n, 4096);
+    const int stripe = std::min(n, gemm_stripe_rows);
     // Keep the transformed activations in FP32, including near cancellation.
     ggml_cuda_pool_alloc<float> weights(ctx.pool(), size_t(stripe) * k);
     const float alpha = 1.0f, beta = 0.0f;
@@ -230,41 +188,7 @@ static void product(ggml_backend_cuda_context & ctx, const uint32_t * codes, con
     }
 }
 
-// Fuse the ascending Sylvester stages and normalization in one workgroup per run.
-static __global__ void fwht_lds(float * data, int run, float factor) {
-    extern __shared__ float scratch[];
-    float * values = data + size_t(blockIdx.x) * run;
-    const int lane = threadIdx.x;
-    const int width = blockDim.x;
-    for (int index = lane; index < run; index += width) {
-        scratch[index] = values[index];
-    }
-    __syncthreads();
-    for (int step = 1; step < run; step *= 2) {
-        for (int pair = lane; pair < run / 2; pair += width) {
-            const int index = (pair / step) * (2 * step) + pair % step;
-            const float a = scratch[index];
-            const float b = scratch[index + step];
-            scratch[index] = a + b;
-            scratch[index + step] = a - b;
-        }
-        __syncthreads();
-    }
-    for (int index = lane; index < run; index += width) {
-        values[index] = scratch[index] * factor;
-    }
-}
-
 static void fwht(float * data, size_t count, int run, cudaStream_t stream) {
-    static const bool use_lds = [] {
-        const char * value = std::getenv("GGML_HIP_TRELLIS_LDS_FWHT");
-        return value && value[0] == '1' && value[1] == '\0';
-    }();
-    if (use_lds && run >= 16 && run <= 8192) {
-        fwht_lds<<<count / run, threads, size_t(run) * sizeof(float), stream>>>(
-            data, run, float(1.0 / std::sqrt(double(run))));
-        return;
-    }
     for (int step = 1; step < run; step *= 2) {
         butterfly<<<blocks(count / 2), threads, 0, stream>>>(data, step, count / 2);
     }
@@ -326,16 +250,59 @@ static void apply_side(ggml_backend_cuda_context & ctx, float * data, int width,
 bool ggml_cuda_trellis_supported(const ggml_tensor * op) {
     const auto * w = op->src[0];
     const auto * x = op->src[1];
+    if (!w || !x || !ggml_is_trellis_type(w->type) || !ggml_is_matrix(w)) {
+        return false;
+    }
+    const int64_t k = w->ne[0];
+    const int64_t n = w->ne[1];
+    if (k <= 0 || n <= 0 || k > INT32_MAX || n > INT32_MAX || !ggml_is_contiguous(w)) {
+        return false;
+    }
+    if (x->type != GGML_TYPE_F32 || x->ne[0] != k || x->nb[0] != sizeof(float) || x->nb[1] % sizeof(float) != 0 ||
+        op->type != GGML_TYPE_F32 || op->ne[0] != n) {
+        return false;
+    }
+
+    // The kernels flatten the input rows and use one-dimensional launch grids.
+    const int64_t max_rows = INT32_MAX / std::max(k, n);
+    int64_t rows = 1;
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        if (x->ne[i] <= 0 || x->ne[i] > max_rows / rows || op->ne[i] != x->ne[i] ||
+            x->nb[1] > SIZE_MAX / rows || x->nb[i] != x->nb[1] * rows) {
+            return false;
+        }
+        rows *= x->ne[i];
+    }
+    if ((rows > 1 && x->nb[1] > (SIZE_MAX - k * sizeof(float)) / (rows - 1)) ||
+        (rows >= gemm_min_tokens && k > INT32_MAX / std::min<int64_t>(n, gemm_stripe_rows))) {
+        return false;
+    }
     const auto * d = reinterpret_cast<const int32_t *>(op->op_params);
-    return ggml_is_trellis_type(w->type) && x->type == GGML_TYPE_F32 &&
-           x->nb[0] == sizeof(float) && x->nb[1] % sizeof(float) == 0 &&
-           x->nb[2] == x->nb[1] * x->ne[1] && x->nb[3] == x->nb[2] * x->ne[2] &&
-           ggml_is_contiguous(op) && w->ne[0] <= INT32_MAX && w->ne[1] <= INT32_MAX &&
-           ggml_nrows(x) <= INT32_MAX / w->ne[1] &&
-           d[6] >= 0 && d[6] <= 8 && ggml_trellis_desc_supported(w->ne[0], w->ne[1], d, 7 + d[6]);
+    if (!ggml_is_contiguous(op) || d[6] < 0 || d[6] > GGML_TRELLIS_MAX_PARTS ||
+        !ggml_trellis_desc_supported(k, n, d, 7 + d[6])) {
+        return false;
+    }
+
+    const ggml_type types[] = {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I32, GGML_TYPE_I32};
+    const int64_t lengths[] = {k / 16, k, n, k, n};
+    for (int i = 0; i < 5; ++i) {
+        const auto * t = op->src[i + 2];
+        if (!t) {
+            if (i < 3) {
+                return false;
+            }
+        } else if (t->type != types[i] || !ggml_is_vector(t) || t->ne[0] != lengths[i] || !ggml_is_contiguous(t)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void ggml_cuda_op_trellis(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (ggml_cuda_info().devices[ctx.device].cc == GGML_TRELLIS_HIP_GFX1201 && trellis_hip_rdna4::supports(dst)) {
+        trellis_hip_rdna4::mul_mat(ctx, dst);
+        return;
+    }
     const auto * w = dst->src[0];
     const auto * x = dst->src[1];
     const auto * d = reinterpret_cast<const int32_t *>(dst->op_params);

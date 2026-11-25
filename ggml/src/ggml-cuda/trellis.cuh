@@ -2,6 +2,11 @@
 
 #include "common.cuh"
 
+#if defined(GGML_USE_HIP) && defined(__linux__)
+static constexpr int GGML_TRELLIS_HIP_GFX1100 = GGML_CUDA_CC_OFFSET_AMD + 0x1100;
+static constexpr int GGML_TRELLIS_HIP_GFX1201 = GGML_CUDA_CC_OFFSET_AMD + 0x1201;
+#endif
+
 // trellis fork: GGML_OP_TRELLIS (ggml_trellis_mul_mat) through libtrellis
 void ggml_cuda_op_trellis(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
@@ -21,7 +26,7 @@ void ggml_cuda_op_trellis_group(ggml_backend_cuda_context & ctx, ggml_tensor * c
 // The MLP chain: nodes[i], nodes[i + 1] an input group of up and gate, nodes[i + 2] swiglu(gate, up), nodes[i + 3]
 // down reading it, with up's and gate's output sides and down's input side rht<b> of one b (256-4096), the three
 // intermediate tensors read nowhere else. Returns 4 when they are (0: no chain).
-int ggml_cuda_trellis_mlp_chain(const ggml_cgraph * cgraph, int i);
+int ggml_cuda_trellis_mlp_chain(const ggml_cgraph * cgraph, int i, int device);
 
 // The chain: the group's raw products, then the two output rotations, the swiglu and down's input rotation as one
 // kernel, then down's product. The same bytes as the four nodes one by one; the swiglu node's dst is not written.
