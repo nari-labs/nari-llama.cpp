@@ -1,5 +1,8 @@
 #version 450
 #extension GL_EXT_control_flow_attributes : require
+#ifdef TRELLIS_VERIFY_I32
+#extension GL_EXT_shader_16bit_storage : require
+#endif
 
 // Quantizes the rotated activations of a Trellis product to int8 for trellis_matvec_q8, with one scale per 16
 // inputs (one tile column), absmax / 127. For tile column g and lane group q, reps holds the four inputs that the
@@ -14,6 +17,9 @@ layout(binding = 1) writeonly buffer Packed { uint packed[]; };
 layout(binding = 1) writeonly buffer Reps { uvec4 reps[]; };
 #endif
 layout(binding = 1) writeonly buffer Meta { uvec2 qmeta[]; };
+#ifdef TRELLIS_VERIFY_I32
+layout(binding = 2) readonly buffer Scales { float16_t scales[]; };
+#endif
 
 layout(push_constant) uniform Parameters {
     uint k;
@@ -24,6 +30,34 @@ layout(push_constant) uniform Parameters {
 
 void main() {
     const uint groups = p.k / 16;
+#ifdef TRELLIS_VERIFY_I32
+    // Fold the per-tile weight scales into the activations before sharing an int8 scale.
+    const uint block = gl_GlobalInvocationID.x;
+    const uint token = gl_GlobalInvocationID.y;
+    if (block >= groups / 2) {
+        return;
+    }
+    const uint g0 = block * 2;
+    const uint base = token * p.k + 16 * g0;
+    float amax = 0.0;
+    for (uint j = 0; j < 2; ++j) {
+        const float s = float(scales[p.scale_offset + g0 + j]);
+        [[unroll]] for (uint i = 0; i < 16; ++i) {
+            amax = max(amax, abs(s * x[base + j * 16 + i]));
+        }
+    }
+    const float inv = amax > 0.0 ? 127.0 / amax : 0.0;
+    for (uint j = 0; j < 2; ++j) {
+        const float inv_scaled = inv * float(scales[p.scale_offset + g0 + j]);
+        [[unroll]] for (uint lq = 0; lq < 4; ++lq) {
+            const uint i = base + j * 16 + 2 * lq;
+            const ivec4 q = clamp(ivec4(round(vec4(x[i], x[i + 1], x[i + 8], x[i + 9]) * inv_scaled)), -127, 127);
+            const uvec4 bytes = uvec4(q) & 255u;
+            packed[(token * groups + g0 + j) * 4 + lq] = bytes.x | (bytes.y << 8) | (bytes.z << 16) | (bytes.w << 24);
+        }
+    }
+    qmeta[p.batch * groups * 2 + token * (groups / 2) + block] = uvec2(0, floatBitsToUint(amax / 127.0));
+#else
     const uint g = gl_GlobalInvocationID.x;
     const uint token = gl_GlobalInvocationID.y;
     if (g >= groups) {
@@ -63,4 +97,5 @@ void main() {
         qmeta[meta_base + index] = uvec2(uint(504 * (c0 + c1 + c2 + c3)), floatBitsToUint(d));
 #endif
     }
+#endif
 }

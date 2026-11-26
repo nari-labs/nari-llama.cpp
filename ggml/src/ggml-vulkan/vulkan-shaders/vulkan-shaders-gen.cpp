@@ -876,6 +876,8 @@ void process_shaders() {
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
     string_to_spv("trellis_verify", "trellis_verify_cm.comp", {}, true, true);
+    string_to_spv("trellis_verify_i32", "trellis_verify_cm.comp", {{"TRELLIS_VERIFY_I32", "1"}}, true, true);
+    string_to_spv("trellis_quant_i32", "trellis_quant.comp", {{"TRELLIS_VERIFY_I32", "1"}, {"TRELLIS_Q8_PACKED", "1"}});
     string_to_spv("trellis_verify16", "trellis_verify16_cm.comp", {}, true, true);
 #endif
     string_to_spv("trellis_matmul", "trellis_product.comp", {{"TRELLIS_COOPMAT", "1"}}, true, true);

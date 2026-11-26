@@ -3614,6 +3614,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
     if (device->integer_dot_product_packed_mixed) {
         ggml_vk_create_pipeline(device, device->pipeline_trellis_quant_packed, "trellis_quant_packed", trellis_quant_packed_len, trellis_quant_packed_data, "main", 2, sizeof(vk_trellis_product), {64, 1, 1}, {}, 1);
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+        ggml_vk_create_pipeline(device, device->pipeline_trellis_quant_i32, "trellis_quant_i32", trellis_quant_i32_len, trellis_quant_i32_data, "main", 3, sizeof(vk_trellis_product), {64, 1, 1}, {}, 1);
+#endif
     }
 #endif
     ggml_vk_create_pipeline(device, device->pipeline_trellis_cross, "trellis_cross", trellis_cross_len, trellis_cross_data, "main", 2, sizeof(vk_trellis_transform), {256, 1, 1}, {}, 1);
@@ -3634,6 +3637,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             device->subgroup_size_control && device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size) {
             ggml_vk_create_pipeline(device, device->pipeline_trellis_verify_cm[i], "trellis_verify_cm",
                                     trellis_verify_cm1_len, trellis_verify_cm1_data, "main", 4,
+                                    sizeof(vk_trellis_product), {16, 1, 1}, {i + 1}, 1, false, true, 32);
+            ggml_vk_create_pipeline(device, device->pipeline_trellis_verify_i32_cm[i], "trellis_verify_i32_cm",
+                                    trellis_verify_i32_cm1_len, trellis_verify_i32_cm1_data, "main", 4,
                                     sizeof(vk_trellis_product), {16, 1, 1}, {i + 1}, 1, false, true, 32);
             ggml_vk_create_pipeline(device, device->pipeline_trellis_verify16_cm[i], "trellis_verify16_cm",
                                     trellis_verify16_cm1_len, trellis_verify16_cm1_data, "main", 4,
