@@ -91,7 +91,20 @@ void main() {
     const uint blocks = tile_k / 2;
     const uint bchunk = (blocks + gl_NumWorkGroups.y - 1) / gl_NumWorkGroups.y;
     const uint bend = min(blocks, (part + 1) * bchunk);
-    for (uint block = part * bchunk + sg; block < bend; block += 4) {
+#if TRELLIS_VERIFY_ROWS != 1
+#error "TRELLIS_VERIFY_I32 takes one row tile per workgroup"
+#endif
+    // the code words and activations of the next tile column are read while this one is decoded
+    const uint first_block = part * bchunk + sg;
+    uvec4 code = uvec4(0);
+    uvec4 words = uvec4(0);
+    if (first_block < bend) {
+        code = trellis_load8((row_tile0 * tile_k + 2 * first_block) * TILE_WORDS, word_index);
+        if (lane < p.batch) {
+            words = packed4[lane * tile_k + 2 * first_block];
+        }
+    }
+    for (uint block = first_block; block < bend; block += 4) {
         // per token column: the scale of the block and its bias, 2 x the sum of its int8 activations
         if (lane < MAX_TOKENS) {
             uvec2 meta = uvec2(0);
@@ -106,22 +119,22 @@ void main() {
         coopMatLoad(dots0, tile_bias, 16 * sg, 0, gl_CooperativeMatrixLayoutRowMajor);
         IACC dots1 = dots0;
         [[unroll]] for (uint j = 0; j < 2; ++j) {
-            const uint col = 2 * block + j;
-            [[unroll]] for (uint r = 0; r < ROWS; ++r) {
-                if (r < row_tiles) {
-                    uvec4 lo, hi;
-                    trellis_states8_from(trellis_load8(((row_tile0 + r) * tile_k + col) * TILE_WORDS, word_index), 8 * lane, lo, hi);
-                    weight_tile[weight_base + 64 * r + lane] = pack_signed_weights(lo);
-                    weight_tile[weight_base + 64 * r + 32 + lane] = pack_signed_weights(hi);
+            const uvec4 cur_code = code;
+            const uvec4 cur_words = words;
+            const uint next_col = j == 0 ? 2 * block + 1 : 2 * (block + 4);
+            if (j == 0 || block + 4 < bend) {
+                code = trellis_load8((row_tile0 * tile_k + next_col) * TILE_WORDS, word_index);
+                if (lane < p.batch) {
+                    words = packed4[lane * tile_k + next_col];
                 }
             }
+            uvec4 lo, hi;
+            trellis_states8_from(cur_code, 8 * lane, lo, hi);
+            weight_tile[weight_base + lane] = pack_signed_weights(lo);
+            weight_tile[weight_base + 32 + lane] = pack_signed_weights(hi);
             if (lane < MAX_TOKENS) {
-                uvec4 words = uvec4(0);
-                if (lane < p.batch) {
-                    words = packed4[lane * tile_k + col];
-                }
                 [[unroll]] for (uint i = 0; i < 4; ++i) {
-                    act_tile[base + 4 * lane + i] = words[i];
+                    act_tile[base + 4 * lane + i] = cur_words[i];
                 }
             }
             sync_tile();
@@ -131,11 +144,6 @@ void main() {
                 coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
                 coopMatLoad(a, weight_tile, weight_base, 4, gl_CooperativeMatrixLayoutRowMajor);
                 dots0 = coopMatMulAdd(a, b, dots0);
-            }
-            if (ROWS > 1 && row_tiles > 1) {
-                coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
-                coopMatLoad(a, weight_tile, weight_base + 64, 4, gl_CooperativeMatrixLayoutRowMajor);
-                dots1 = coopMatMulAdd(a, b, dots1);
             }
             sync_tile();
         }
