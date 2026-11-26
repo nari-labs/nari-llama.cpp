@@ -3598,6 +3598,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_trellis_block_shuffle, "trellis_block_shuffle",
                                 trellis_block_shuffle_len, trellis_block_shuffle_data, "main", 1, sizeof(vk_trellis_transform),
                                 {1, 1, 1}, {}, 1, false, true, 32);
+        ggml_vk_create_pipeline(device, device->pipeline_trellis_chain, "trellis_chain", trellis_chain_len, trellis_chain_data, "main", 6,
+                                sizeof(vk_trellis_chain_pc), {1, 1, 1}, {}, 1, false, true, 32);
     }
     ggml_vk_create_pipeline(device, device->pipeline_trellis_butterfly, "trellis_butterfly", trellis_butterfly_len, trellis_butterfly_data, "main", 1, sizeof(vk_trellis_transform), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_trellis_prep16, "trellis_prep16", trellis_prep16_len, trellis_prep16_data, "main", 3, sizeof(vk_trellis_product), {1, 1, 1}, {}, 1);
@@ -13344,6 +13346,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         }
         break;
     case GGML_OP_GLU:
+        if (ctx->trellis_chain_glu.count(node)) {
+            ggml_vk_trellis_chain(ctx, compute_ctx, node);
+            break;
+        }
         switch (ggml_get_glu_op(node)) {
         case GGML_GLU_OP_GEGLU:
         case GGML_GLU_OP_REGLU:
@@ -15082,6 +15088,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                                                                   ggml_vk_trellis_quant_size(ctx->device, node));
         }
     }
+    ggml_vk_trellis_plan_chains(ctx, cgraph);
     if (trellis_scratch_size > (ctx->trellis_scratch ? ctx->trellis_scratch->size : 0)) {
         if (ctx->trellis_scratch) {
             ggml_backend_vk_synchronize(backend);

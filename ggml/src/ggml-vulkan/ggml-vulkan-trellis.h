@@ -33,6 +33,14 @@ struct vk_trellis_transform {
     float scale;
 };
 
+struct vk_trellis_chain_pc {
+    uint32_t n, len;
+    uint32_t gate, up, post_gate, post_up, pre_down, dst;
+    float scale;
+};
+
+void ggml_vk_trellis_plan_chains(ggml_backend_vk_context * ctx, const ggml_cgraph * graph);
+void ggml_vk_trellis_chain(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * glu);
 size_t ggml_vk_trellis_scratch_stride(const vk_device & device, const ggml_tensor * op);
 size_t ggml_vk_trellis_quant_size(const vk_device & device, const ggml_tensor * op);
 bool ggml_vk_trellis_supported(const vk_device & device, const ggml_tensor * op);

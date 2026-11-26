@@ -232,6 +232,107 @@ static void ggml_vk_trellis_side(ggml_backend_vk_context * ctx, vk_context & sub
     }
 }
 
+// default (GGML_VK_TRELLIS_CHAIN=0 turns it off): Trellis MLP chains up / gate -> SwiGLU -> down of prompt batches. gate and up write their
+// raw products, trellis_chain.comp does their output transforms and scales, SwiGLU and the input scale and transform
+// of down, and down starts from the product. Only for block transforms of the same length (up to 2048) on both sides
+// of the SwiGLU, without gathers, when each intermediate has exactly one consumer.
+static bool ggml_vk_trellis_chain_enabled() {
+    static const bool enabled = [] { const char * opt = std::getenv("GGML_VK_TRELLIS_CHAIN"); return !opt || std::strcmp(opt, "0") != 0; }();
+    return enabled;
+}
+
+void ggml_vk_trellis_plan_chains(ggml_backend_vk_context * ctx, const ggml_cgraph * graph) {
+    ctx->trellis_raw_out.clear();
+    ctx->trellis_chain_glu.clear();
+    ctx->trellis_chain_in.clear();
+    if (!ggml_vk_trellis_chain_enabled() || !ctx->device->pipeline_trellis_chain) {
+        return;
+    }
+    std::unordered_map<const ggml_tensor *, int> uses;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * node = graph->nodes[i];
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (node->src[j]) {
+                uses[node->src[j]]++;
+            }
+        }
+    }
+    const auto aligned = [&](const ggml_tensor * t) {
+        return get_misalign_bytes(ctx, t) == 0 && ggml_is_contiguous(t) && !(t->flags & GGML_TENSOR_FLAG_OUTPUT);
+    };
+    // block transform without gathers: side 0 of desc is the output side, side 3 the input side
+    const auto block_side = [](const ggml_tensor * t, int side) {
+        const int32_t * d = t->op_params;
+        return d[side] == 1 ? d[side + 1] : 0;
+    };
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * glu = graph->nodes[i];
+        if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0 ||
+            glu->type != GGML_TYPE_F32 || ggml_nrows(glu) <= 16) {
+            continue;
+        }
+        const ggml_tensor * gate = glu->src[0];
+        const ggml_tensor * up = glu->src[1];
+        if (!gate || !up || gate->op != GGML_OP_TRELLIS || up->op != GGML_OP_TRELLIS || gate == up ||
+            uses[gate] != 1 || uses[up] != 1 || uses[glu] != 1 || !ggml_are_same_shape(gate, up) || !ggml_are_same_shape(gate, glu) ||
+            !aligned(gate) || !aligned(up) || !aligned(glu) || gate->src[6] || up->src[6]) {
+            continue;
+        }
+        const ggml_tensor * down = nullptr;
+        for (int j = i + 1; j < graph->n_nodes; ++j) {
+            const ggml_tensor * node = graph->nodes[j];
+            if (node->op == GGML_OP_TRELLIS && node->src[1] == glu) {
+                down = node;
+                break;
+            }
+        }
+        const uint32_t len = block_side(gate, 0);
+        const uint32_t n = gate->ne[0];
+        // n >= 8192: the products of gate and up never split k, so they write straight into their outputs
+        if (!down || down->src[5] || len == 0 || len > 2048 || len % 256 != 0 || n % len != 0 || n < 8192 ||
+            block_side(up, 0) != len || block_side(down, 3) != len || down->op_params[0] != 1 || down->src[0]->ne[0] != n) {
+            continue;
+        }
+        ctx->trellis_raw_out.insert(gate);
+        ctx->trellis_raw_out.insert(up);
+        ctx->trellis_chain_glu.insert(glu);
+        ctx->trellis_chain_in.insert(down);
+    }
+}
+
+void ggml_vk_trellis_chain(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * glu) {
+    const ggml_tensor * gate = glu->src[0];
+    const ggml_tensor * up = glu->src[1];
+    const ggml_tensor * down = nullptr;
+    for (const ggml_tensor * t : ctx->trellis_chain_in) {
+        if (t->src[1] == glu) {
+            down = t;
+            break;
+        }
+    }
+    GGML_ASSERT(down);
+    const auto buffer = [&](const ggml_tensor * t) { return ggml_vk_tensor_subbuffer(ctx, t, true); };
+    const auto offset = [&](const ggml_tensor * t) -> uint32_t { return get_misalign_bytes(ctx, t) / ggml_type_size(t->type); };
+    const ggml_tensor * post_gate = gate->src[4];
+    const ggml_tensor * post_up = up->src[4];
+    const ggml_tensor * pre_down = down->src[3];
+    vk_trellis_chain_pc pc = {};
+    pc.n = gate->ne[0];
+    pc.len = gate->op_params[1];
+    pc.gate = offset(gate);
+    pc.up = offset(up);
+    pc.post_gate = offset(post_gate);
+    pc.post_up = offset(post_up);
+    pc.pre_down = offset(pre_down);
+    pc.dst = offset(glu);
+    pc.scale = float(1.0 / std::sqrt(double(pc.len)));
+    auto & pipeline = ctx->device->pipeline_trellis_chain;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                              { buffer(gate), buffer(up), buffer(post_gate), buffer(post_up), buffer(pre_down), buffer(glu) }, pc,
+                              { uint32_t(pc.n / pc.len), uint32_t(ggml_nrows(glu)), 1 });
+}
+
 void ggml_vk_trellis(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * op) {
     const ggml_tensor * w = op->src[0];
     const ggml_tensor * x = op->src[1];
@@ -259,6 +360,9 @@ void ggml_vk_trellis(ggml_backend_vk_context * ctx, vk_context & subctx, const g
     pc.n = n;
 
     const bool wide = ggml_vk_trellis_use_wide(ctx->device, op);
+    // part of a Trellis MLP chain (ggml_vk_trellis_plan_chains): raw products for gate and up, rotated input for down
+    const bool raw_out = !rows && ctx->trellis_raw_out.count(op) != 0;
+    const bool pre_in = !rows && ctx->trellis_chain_in.count(op) != 0;
     uint32_t batch = 0;
     for (pc.first = 0; pc.first < tokens; pc.first += batch) {
         const uint32_t remaining = tokens - pc.first;
@@ -266,6 +370,8 @@ void ggml_vk_trellis(ggml_backend_vk_context * ctx, vk_context & subctx, const g
         batch = wide_chunk ? VK_TRELLIS_WIDE_BATCH : std::min(remaining, VK_TRELLIS_BATCH);
         vk_subbuffer a = { ctx->trellis_scratch, 0, stride };
         vk_subbuffer b = { ctx->trellis_scratch, stride, stride };
+        const vk_subbuffer raw_dst = { dst_buf.buffer, dst_buf.offset + size_t(pc.first) * n * sizeof(float), size_t(batch) * n * sizeof(float) };
+        bool raw_written = false;
         // Scratch is shared by unrelated graph nodes.
         ggml_vk_sync_buffers(ctx, subctx);
         ggml_vk_trellis_stamp(ctx, subctx, TRELLIS_PROFILE_START);
@@ -310,9 +416,9 @@ void ggml_vk_trellis(ggml_backend_vk_context * ctx, vk_context & subctx, const g
         // (trellis_fused.comp, one workgroup per block and token)
         static const bool fuse_enabled = [] { const char * opt = std::getenv("GGML_VK_TRELLIS_FUSE"); return !opt || std::strcmp(opt, "0") != 0; }();
         const int32_t * side_in = desc + 3;
-        const bool fuse_in = fuse_enabled && batch < 16 && side_in[0] == 1 && side_in[1] > 0 && side_in[1] <= int32_t(VK_TRELLIS_BLOCK_LIMIT) &&
+        const bool fuse_in = fuse_enabled && !pre_in && batch < 16 && side_in[0] == 1 && side_in[1] > 0 && side_in[1] <= int32_t(VK_TRELLIS_BLOCK_LIMIT) &&
                              side_in[1] % 16 == 0 && k % side_in[1] == 0;
-        const bool fuse_out = fuse_enabled && batch < 16 && desc[0] == 1 && desc[6] == 0 && desc[1] > 0 &&
+        const bool fuse_out = fuse_enabled && !raw_out && batch < 16 && desc[0] == 1 && desc[6] == 0 && desc[1] > 0 &&
                               desc[1] <= int32_t(VK_TRELLIS_BLOCK_LIMIT) && n % desc[1] == 0 && pout == nullptr;
         vk_trellis_fused fused_in_pc = {};
         fused_in_pc.k = k;
@@ -331,7 +437,10 @@ void ggml_vk_trellis(ggml_backend_vk_context * ctx, vk_context & subctx, const g
             ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, pre_buf, pin_buf, out }, fused_in_pc, { k / fused_in_pc.len, batch, 1 });
             ggml_vk_sync_buffers(ctx, subctx);
         };
-        if (!fuse_in) {
+        if (pre_in) {
+            // the rotated input of this chunk, straight from the SwiGLU output
+            a = { x_buf.buffer, x_buf.offset + size_t(pc.first) * k * sizeof(float), size_t(batch) * k * sizeof(float) };
+        } else if (!fuse_in) {
             auto & input = ctx->device->pipeline_trellis_input;
             ggml_pipeline_request_descriptor_sets(ctx, input, 1);
             ggml_vk_dispatch_pipeline(ctx, subctx, input, { x_buf, pre_buf, pin_buf, a }, pc, { k, batch, 1 });
@@ -410,7 +519,8 @@ void ggml_vk_trellis(ggml_backend_vk_context * ctx, vk_context & subctx, const g
                 splits = std::min<uint32_t>({ 16, CEIL_DIV(64, groups), tiles / 16, uint32_t(stride / (sizeof(float) * n * batch)) });
                 splits = std::max<uint32_t>(splits, 1);
             }
-            ggml_vk_dispatch_pipeline(ctx, subctx, product, { w_buf, scale_buf, c, b },
+            raw_written = raw_out && splits == 1;
+            ggml_vk_dispatch_pipeline(ctx, subctx, product, { w_buf, scale_buf, c, raw_written ? raw_dst : b },
                                       vk_trellis_product{ k, n, batch, offset(scales) }, { n, splits, 1 });
             if (splits > 1) {
                 ggml_vk_sync_buffers(ctx, subctx);
@@ -447,7 +557,8 @@ void ggml_vk_trellis(ggml_backend_vk_context * ctx, vk_context & subctx, const g
                 splits = std::min<uint32_t>({ 16, CEIL_DIV(64, groups), tiles / 16, uint32_t(stride / (sizeof(float) * n * batch)) });
                 splits = std::max<uint32_t>(splits, 1);
             }
-            ggml_vk_dispatch_pipeline(ctx, subctx, product, { w_buf, scale_buf, c, b },
+            raw_written = raw_out && splits == 1;
+            ggml_vk_dispatch_pipeline(ctx, subctx, product, { w_buf, scale_buf, c, raw_written ? raw_dst : b },
                                       vk_trellis_product{ k, n, batch, offset(scales) }, { n, splits, 1 });
             if (splits > 1) {
                 ggml_vk_sync_buffers(ctx, subctx);
@@ -466,6 +577,15 @@ void ggml_vk_trellis(ggml_backend_vk_context * ctx, vk_context & subctx, const g
                                       vk_trellis_product{ k, n, batch, offset(scales) }, { n, batch, 1 });
         }
         ggml_vk_sync_buffers(ctx, subctx);
+        if (raw_out) {
+            if (!raw_written) {
+                const vk::BufferCopy region { b.offset, raw_dst.offset, raw_dst.size };
+                subctx->s->buffer->buf.copyBuffer(b.buffer->buffer, raw_dst.buffer->buffer, region);
+                ggml_vk_sync_buffers(ctx, subctx);
+            }
+            ggml_vk_trellis_stamp(ctx, subctx, TRELLIS_PROFILE_PRODUCT);
+            continue;
+        }
         ggml_vk_trellis_stamp(ctx, subctx, TRELLIS_PROFILE_PRODUCT);
         if (fuse_out) {
             vk_trellis_fused out_pc = {};

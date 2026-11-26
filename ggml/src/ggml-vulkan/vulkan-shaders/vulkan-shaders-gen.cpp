@@ -860,6 +860,7 @@ void process_shaders() {
     string_to_spv("trellis_fused_in_q8", "trellis_fused.comp", {{"TRELLIS_FUSED_IN", "1"}, {"TRELLIS_FUSED_Q8", "1"}});
     string_to_spv("trellis_fused_in_q8_packed", "trellis_fused.comp", {{"TRELLIS_FUSED_IN", "1"}, {"TRELLIS_FUSED_Q8", "1"}, {"TRELLIS_Q8_PACKED", "1"}});
     string_to_spv("trellis_fused_out", "trellis_fused.comp", {{"TRELLIS_FUSED_OUT", "1"}});
+    string_to_spv("trellis_chain", "trellis_chain.comp", {});
     string_to_spv("trellis_decode_rows", "trellis_io.comp", {{"TRELLIS_DECODE_ROWS", "1"}});
     string_to_spv("trellis_store_rows", "trellis_io.comp", {{"TRELLIS_STORE_ROWS", "1"}});
     string_to_spv("trellis_matvec", "trellis_product.comp", {{"TRELLIS_MATVEC", "1"}});

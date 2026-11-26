@@ -62,6 +62,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <shared_mutex>
 #include <mutex>
 #include <future>
@@ -885,7 +886,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_trellis_input, pipeline_trellis_output, pipeline_trellis_store_rows;
     vk_pipeline pipeline_trellis_fused_in, pipeline_trellis_fused_in_q8, pipeline_trellis_fused_in_q8_packed, pipeline_trellis_fused_out;
     vk_pipeline pipeline_trellis_block, pipeline_trellis_butterfly, pipeline_trellis_cross;
-    vk_pipeline pipeline_trellis_block_shuffle;
+    vk_pipeline pipeline_trellis_block_shuffle, pipeline_trellis_chain;
     vk_pipeline pipeline_trellis_matvec[6], pipeline_trellis_matmul[6], pipeline_trellis_decode_rows[6];
     vk_pipeline pipeline_trellis_matvec_q8[6], pipeline_trellis_matvec_q8x4[6], pipeline_trellis_quant, pipeline_trellis_reduce;
     vk_pipeline pipeline_trellis_matvec_q8x4_packed[6], pipeline_trellis_quant_packed;
@@ -1380,6 +1381,10 @@ struct ggml_backend_vk_context {
     // Extra timestamps for the stages within a Trellis operator.
     uint32_t trellis_query_base {};
     std::vector<uint8_t> trellis_query_stages;
+
+    // Trellis MLP chains of the current graph (ggml_vk_trellis_plan_chains): gate and up products that keep their raw
+    // output, the SwiGLU nodes that run trellis_chain.comp, and the down products that read an already rotated input
+    std::unordered_set<const ggml_tensor *> trellis_raw_out, trellis_chain_glu, trellis_chain_in;
 };
 
 struct ggml_backend_vk_buffer_context {
