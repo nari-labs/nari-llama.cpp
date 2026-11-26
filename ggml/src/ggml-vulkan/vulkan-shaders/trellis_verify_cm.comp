@@ -54,6 +54,8 @@ void sync_tile() {
 }
 
 void main() {
+    // k < 2^31: the shifted bit is always zero
+    trellis_hash_init(p.k >> 31);
     const uint lane = gl_SubgroupInvocationID;
     const uint sg = gl_SubgroupID;
     const uint base = sg * 64;

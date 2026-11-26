@@ -54,6 +54,8 @@ shared float partial_lo[MAX_TOKENS * 128];
 shared float partial_hi[MAX_TOKENS * 128];
 
 void main() {
+    // k < 2^31: the shifted bit is always zero
+    trellis_hash_init(p.k >> 31);
     const uint thread_id = gl_LocalInvocationID.x;
     const uint lane = thread_id % 32;
     const uint split = thread_id / 32;
@@ -150,6 +152,8 @@ shared float partial_lo[128];
 shared float partial_hi[128];
 
 void main() {
+    // k < 2^31: the shifted bit is always zero
+    trellis_hash_init(p.k >> 31);
     const uint thread_id = gl_LocalInvocationID.x;
     const uint lane = thread_id % 32;
     const uint split = thread_id / 32;
@@ -192,6 +196,8 @@ shared float16_t act_lo[256 * SUBGROUPS];
 shared float result[256 * SUBGROUPS];
 
 void main() {
+    // k < 2^31: the shifted bit is always zero
+    trellis_hash_init(p.k >> 31);
     const uint tid = gl_LocalInvocationID.x;
     const uint token_start = TOKEN_TILE * gl_WorkGroupID.y;
     const uint tile_k = p.k / 16;
@@ -250,6 +256,8 @@ shared float weights[256];
 shared float activations[256];
 
 void main() {
+    // k < 2^31: the shifted bit is always zero
+    trellis_hash_init(p.k >> 31);
     const uint thread_id = gl_LocalInvocationID.x;
     const uint row = thread_id % 16;
     const uint col = thread_id / 16;

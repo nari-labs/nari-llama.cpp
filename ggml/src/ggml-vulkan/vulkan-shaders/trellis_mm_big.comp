@@ -55,6 +55,8 @@ float trellis_value4x(uint state) {
 #define AMAT coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
 
 void main() {
+    // k < 2^31: the shifted bit is always zero
+    trellis_hash_init(p.k >> 31);
     const uint tid = gl_LocalInvocationID.x;
     const uint sg = gl_SubgroupID;
     const uint lane = gl_SubgroupInvocationID;

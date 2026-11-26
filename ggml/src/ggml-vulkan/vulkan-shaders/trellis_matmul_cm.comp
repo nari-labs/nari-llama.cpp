@@ -92,6 +92,8 @@ void decode_tile(const uint slot, const uint lane, const uint row_tile0, const u
 }
 
 void main() {
+    // k < 2^31: the shifted bit is always zero
+    trellis_hash_init(p.k >> 31);
     const uint tid = gl_LocalInvocationID.x;
     const uint sg = gl_SubgroupID;
     const uint tile_k = p.k / 16;

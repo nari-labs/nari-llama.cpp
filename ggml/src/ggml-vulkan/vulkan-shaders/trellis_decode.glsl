@@ -7,15 +7,34 @@ layout(constant_id = 0) const uint BITS = 3;
 const uint TILE_WORDS = 8 * BITS;
 const uint TILE_BITS = 256 * BITS;
 
+// The hash of a 16-bit state, state * 0x83dcd12d, as two 16 x 16-bit products, s * 0xd12d + (s * 0x83dc) << 16: on
+// RDNA these run as full-rate 24-bit multiplies instead of one quarter-rate 32-bit multiply. The compiler folds the two
+// products back into one 32-bit multiply when it sees the constants, so trellis_hash_init sets the halves and the shift
+// from a value it cannot see (an always-zero bit of a push constant). Without the call the hash stays correct.
+uint trellis_hash_lo = 0xd12du;
+uint trellis_hash_hi = 0x83dcu;
+uint trellis_hash_shift = 16u;
+
+void trellis_hash_init(uint zero) {
+    const uint c = 0x83dcd12du ^ zero;
+    trellis_hash_lo = c & 65535u;
+    trellis_hash_hi = c >> 16;
+    trellis_hash_shift = 16u ^ zero;
+}
+
+uint trellis_hash(uint state) {
+    const uint s = state & 65535u;
+    return s * trellis_hash_lo + ((s * trellis_hash_hi) << trellis_hash_shift);
+}
+
 // The value of a state is the sum of these four 6-bit bytes minus 126.
 uint trellis_bytes(uint state) {
-    const uint h = (state & 65535u) * 0x83dcd12du;
-    return (h >> 2) & 0x3f3f3f3fu;
+    return (trellis_hash(state) >> 2) & 0x3f3f3f3fu;
 }
 
 // The same four 6-bit bytes, each times 4: no shift, and the dot products that sum them scale the result back.
 uint trellis_bytes4(uint state) {
-    return ((state & 65535u) * 0x83dcd12du) & 0xfcfcfcfcu;
+    return trellis_hash(state) & 0xfcfcfcfcu;
 }
 
 float trellis_grid(uint state) {
