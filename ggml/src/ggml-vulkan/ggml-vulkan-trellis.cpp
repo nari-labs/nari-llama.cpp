@@ -437,7 +437,18 @@ void ggml_vk_trellis(ggml_backend_vk_context * ctx, vk_context & subctx, const g
             ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, pre_buf, pin_buf, out }, fused_in_pc, { k / fused_in_pc.len, batch, 1 });
             ggml_vk_sync_buffers(ctx, subctx);
         };
-        if (pre_in) {
+        // default (GGML_VK_TRELLIS_PREP_IN=0 turns it off): input, input transform (blocks of 128) and FP16 preparation of a wide prompt chunk in
+        // one launch (trellis_prep16_in.comp), straight from the input to the product
+        static const bool prep_in_enabled = [] { const char * opt = std::getenv("GGML_VK_TRELLIS_PREP_IN"); return !opt || std::strcmp(opt, "0") != 0; }();
+        const bool prep_in = prep_in_enabled && wide_chunk && !pre_in && side_in[0] == 1 && side_in[1] == 128 && k % 128 == 0 &&
+                             k <= 128 * 8 * 6 && ctx->device->pipeline_trellis_prep16_in && ggml_vk_trellis_mm_enabled() &&
+                             ggml_vk_trellis_coopmat_enabled() && !ggml_vk_trellis_residual_enabled() &&
+                             ctx->device->pipeline_trellis_mm_cm1[bits] && ggml_vk_trellis_quant_size(ctx->device, op) > 0 &&
+                             ctx->trellis_scratch->size >= 2 * stride + ggml_vk_trellis_quant_size(ctx->device, op) &&
+                             x->nb[2] == x->nb[1] * x->ne[1] && x->nb[3] == x->nb[2] * x->ne[2];
+        if (prep_in) {
+            // nothing to do here: the product branch below prepares the activations from x
+        } else if (pre_in) {
             // the rotated input of this chunk, straight from the SwiGLU output
             a = { x_buf.buffer, x_buf.offset + size_t(pc.first) * k * sizeof(float), size_t(batch) * k * sizeof(float) };
         } else if (!fuse_in) {
@@ -532,10 +543,19 @@ void ggml_vk_trellis(ggml_backend_vk_context * ctx, vk_context & subctx, const g
                    q8_size > 0 && ctx->trellis_scratch->size >= 2 * stride + q8_size) {
             // Prepare FP16 activations with the tile scales and a power-of-two range per token.
             vk_subbuffer c = { ctx->trellis_scratch, 2 * stride, q8_size };
-            auto & prep = wide_chunk ? ctx->device->pipeline_trellis_prep16_wide : ctx->device->pipeline_trellis_prep16;
-            ggml_pipeline_request_descriptor_sets(ctx, prep, 1);
-            ggml_vk_dispatch_pipeline(ctx, subctx, prep, { a, scale_buf, c }, vk_trellis_product{ k, n, batch, offset(scales) },
-                                      { wide_chunk ? VK_TRELLIS_WIDE_BATCH : VK_TRELLIS_BATCH, 1, 1 });
+            if (prep_in) {
+                vk_trellis_prep_in prep_pc = { k, batch, pc.first, offset(x), pc.strides[0], offset(pre), offset(pin),
+                                               pin != nullptr, offset(scales) };
+                auto & prep = ctx->device->pipeline_trellis_prep16_in;
+                ggml_pipeline_request_descriptor_sets(ctx, prep, 1);
+                ggml_vk_dispatch_pipeline(ctx, subctx, prep, { x_buf, pre_buf, pin_buf, scale_buf, c }, prep_pc,
+                                          { VK_TRELLIS_WIDE_BATCH, 1, 1 });
+            } else {
+                auto & prep = wide_chunk ? ctx->device->pipeline_trellis_prep16_wide : ctx->device->pipeline_trellis_prep16;
+                ggml_pipeline_request_descriptor_sets(ctx, prep, 1);
+                ggml_vk_dispatch_pipeline(ctx, subctx, prep, { a, scale_buf, c }, vk_trellis_product{ k, n, batch, offset(scales) },
+                                          { wide_chunk ? VK_TRELLIS_WIDE_BATCH : VK_TRELLIS_BATCH, 1, 1 });
+            }
             ggml_vk_sync_buffers(ctx, subctx);
             // GGML_VK_TRELLIS_MM_RESIDUAL=1: also multiply the FP16 rounding residuals of the activations
             auto & fp16_product = ggml_vk_trellis_residual_enabled() && ctx->device->pipeline_trellis_mm_res_cm1[bits]
@@ -587,6 +607,17 @@ void ggml_vk_trellis(ggml_backend_vk_context * ctx, vk_context & subctx, const g
             continue;
         }
         ggml_vk_trellis_stamp(ctx, subctx, TRELLIS_PROFILE_PRODUCT);
+        // default (GGML_VK_TRELLIS_OUT128=0 turns it off): output transform (blocks of 128) and output scale in one launch (trellis_out128.comp)
+        static const bool out128_enabled = [] { const char * opt = std::getenv("GGML_VK_TRELLIS_OUT128"); return !opt || std::strcmp(opt, "0") != 0; }();
+        if (out128_enabled && batch >= 16 && desc[0] == 1 && desc[1] == 128 && n % 128 == 0 && pout == nullptr &&
+            ctx->device->pipeline_trellis_out128) {
+            auto & out128 = ctx->device->pipeline_trellis_out128;
+            ggml_pipeline_request_descriptor_sets(ctx, out128, 1);
+            ggml_vk_dispatch_pipeline(ctx, subctx, out128, { b, post_buf, dst_buf }, vk_trellis_out128{ n, pc.first, offset(post), offset(op) },
+                                      { batch, 1, 1 });
+            ggml_vk_trellis_stamp(ctx, subctx, TRELLIS_PROFILE_OUTPUT);
+            continue;
+        }
         if (fuse_out) {
             vk_trellis_fused out_pc = {};
             out_pc.k = n;

@@ -33,6 +33,14 @@ struct vk_trellis_transform {
     float scale;
 };
 
+struct vk_trellis_out128 {
+    uint32_t n, first, post_offset, dst_offset;
+};
+
+struct vk_trellis_prep_in {
+    uint32_t k, batch, first, x_offset, x_stride, pre_offset, gather_offset, use_gather, scale_offset;
+};
+
 struct vk_trellis_chain_pc {
     uint32_t n, len;
     uint32_t gate, up, post_gate, post_up, pre_down, dst;

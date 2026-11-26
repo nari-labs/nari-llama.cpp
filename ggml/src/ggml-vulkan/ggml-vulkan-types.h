@@ -886,7 +886,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_trellis_input, pipeline_trellis_output, pipeline_trellis_store_rows;
     vk_pipeline pipeline_trellis_fused_in, pipeline_trellis_fused_in_q8, pipeline_trellis_fused_in_q8_packed, pipeline_trellis_fused_out;
     vk_pipeline pipeline_trellis_block, pipeline_trellis_butterfly, pipeline_trellis_cross;
-    vk_pipeline pipeline_trellis_block_shuffle, pipeline_trellis_chain;
+    vk_pipeline pipeline_trellis_block_shuffle, pipeline_trellis_chain, pipeline_trellis_out128;
     vk_pipeline pipeline_trellis_matvec[6], pipeline_trellis_matmul[6], pipeline_trellis_decode_rows[6];
     vk_pipeline pipeline_trellis_matvec_q8[6], pipeline_trellis_matvec_q8x4[6], pipeline_trellis_quant, pipeline_trellis_reduce;
     vk_pipeline pipeline_trellis_matvec_q8x4_packed[6], pipeline_trellis_quant_packed;
@@ -894,7 +894,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_trellis_verify16_cm[6], pipeline_trellis_verify16_i32_cm[6];
     vk_pipeline pipeline_trellis_matmul_cm1[6];
     vk_pipeline pipeline_trellis_mm_cm1[6], pipeline_trellis_mm_res_cm1[6], pipeline_trellis_prep16;
-    vk_pipeline pipeline_trellis_mm_wide_cm1[6], pipeline_trellis_prep16_wide;
+    vk_pipeline pipeline_trellis_mm_wide_cm1[6], pipeline_trellis_prep16_wide, pipeline_trellis_prep16_in;
     vk_pipeline pipeline_trellis_mm_big_cm1[6];
     std::array<vk_pipeline, 3> pipeline_rms_norm_f32;
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_f32;

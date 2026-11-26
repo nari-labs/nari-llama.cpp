@@ -861,6 +861,7 @@ void process_shaders() {
     string_to_spv("trellis_fused_in_q8_packed", "trellis_fused.comp", {{"TRELLIS_FUSED_IN", "1"}, {"TRELLIS_FUSED_Q8", "1"}, {"TRELLIS_Q8_PACKED", "1"}});
     string_to_spv("trellis_fused_out", "trellis_fused.comp", {{"TRELLIS_FUSED_OUT", "1"}});
     string_to_spv("trellis_chain", "trellis_chain.comp", {});
+    string_to_spv("trellis_out128", "trellis_out128.comp", {});
     string_to_spv("trellis_decode_rows", "trellis_io.comp", {{"TRELLIS_DECODE_ROWS", "1"}});
     string_to_spv("trellis_store_rows", "trellis_io.comp", {{"TRELLIS_STORE_ROWS", "1"}});
     string_to_spv("trellis_matvec", "trellis_product.comp", {{"TRELLIS_MATVEC", "1"}});
@@ -884,6 +885,7 @@ void process_shaders() {
 #endif
     string_to_spv("trellis_matmul", "trellis_product.comp", {{"TRELLIS_COOPMAT", "1"}}, true, true);
     string_to_spv("trellis_prep16_wide", "trellis_prep16.comp", {{"TRELLIS_MM_WIDE", "1"}});
+    string_to_spv("trellis_prep16_in", "trellis_prep16_in.comp", {});
     string_to_spv("trellis_mm", "trellis_matmul_cm.comp", {}, true, true);
     string_to_spv("trellis_mm_wide", "trellis_matmul_cm.comp", {{"TRELLIS_MM_WIDE", "1"}}, true, true);
     string_to_spv("trellis_mm_big", "trellis_mm_big.comp", {}, true, true);

@@ -3600,6 +3600,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                 {1, 1, 1}, {}, 1, false, true, 32);
         ggml_vk_create_pipeline(device, device->pipeline_trellis_chain, "trellis_chain", trellis_chain_len, trellis_chain_data, "main", 6,
                                 sizeof(vk_trellis_chain_pc), {1, 1, 1}, {}, 1, false, true, 32);
+        ggml_vk_create_pipeline(device, device->pipeline_trellis_out128, "trellis_out128", trellis_out128_len, trellis_out128_data, "main", 3,
+                                sizeof(vk_trellis_out128), {1, 1, 1}, {}, 1, false, true, 32);
     }
     ggml_vk_create_pipeline(device, device->pipeline_trellis_butterfly, "trellis_butterfly", trellis_butterfly_len, trellis_butterfly_data, "main", 1, sizeof(vk_trellis_transform), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_trellis_prep16, "trellis_prep16", trellis_prep16_len, trellis_prep16_data, "main", 3, sizeof(vk_trellis_product), {1, 1, 1}, {}, 1);
@@ -3609,6 +3611,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         device->properties.limits.maxComputeWorkGroupSize[0] >= 512) {
         ggml_vk_create_pipeline(device, device->pipeline_trellis_prep16_wide, "trellis_prep16_wide", trellis_prep16_wide_len,
                                 trellis_prep16_wide_data, "main", 3, sizeof(vk_trellis_product), {1, 1, 1}, {}, 1);
+        if (device->subgroup_shuffle && device->subgroup_arithmetic && device->subgroup_size_control &&
+            device->subgroup_min_size <= 32 && device->subgroup_max_size >= 32) {
+            ggml_vk_create_pipeline(device, device->pipeline_trellis_prep16_in, "trellis_prep16_in", trellis_prep16_in_len,
+                                    trellis_prep16_in_data, "main", 5, sizeof(vk_trellis_prep_in), {1, 1, 1}, {}, 1, false, true, 32);
+        }
     }
 #endif
     ggml_vk_create_pipeline(device, device->pipeline_trellis_reduce, "trellis_reduce", trellis_reduce_len, trellis_reduce_data, "main", 1, sizeof(vk_trellis_product), {64, 1, 1}, {}, 1);
