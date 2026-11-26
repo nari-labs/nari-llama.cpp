@@ -376,8 +376,10 @@ void ggml_vk_trellis(ggml_backend_vk_context * ctx, vk_context & subctx, const g
                 const char * opt = std::getenv("GGML_VK_TRELLIS_VERIFY_I32");
                 return opt && std::strcmp(opt, "1") == 0;
             }();
-            auto & verify_i32 = ctx->device->pipeline_trellis_verify_i32_cm[bits];
-            const bool grouped = verify_i32_enabled && use_verify_cm && batch <= VK_TRELLIS_Q8_TOKENS && k % 32 == 0 && verify_i32;
+            // 2-4 tokens: trellis_verify_cm, 5-16 tokens: trellis_verify16_cm, both with one int8 scale per 32 inputs
+            auto & verify_i32 = batch > VK_TRELLIS_Q8_TOKENS ? ctx->device->pipeline_trellis_verify16_i32_cm[bits]
+                                                             : ctx->device->pipeline_trellis_verify_i32_cm[bits];
+            const bool grouped = verify_i32_enabled && use_verify_cm && k % 32 == 0 && verify_i32;
             if (grouped) {
                 if (fuse_in) {
                     fused_input(ctx->device->pipeline_trellis_fused_in, a);

@@ -879,6 +879,7 @@ void process_shaders() {
     string_to_spv("trellis_verify_i32", "trellis_verify_cm.comp", {{"TRELLIS_VERIFY_I32", "1"}}, true, true);
     string_to_spv("trellis_quant_i32", "trellis_quant.comp", {{"TRELLIS_VERIFY_I32", "1"}, {"TRELLIS_Q8_PACKED", "1"}});
     string_to_spv("trellis_verify16", "trellis_verify16_cm.comp", {}, true, true);
+    string_to_spv("trellis_verify16_i32", "trellis_verify16_cm.comp", {{"TRELLIS_VERIFY_I32", "1"}}, true, true);
 #endif
     string_to_spv("trellis_matmul", "trellis_product.comp", {{"TRELLIS_COOPMAT", "1"}}, true, true);
     string_to_spv("trellis_prep16_wide", "trellis_prep16.comp", {{"TRELLIS_MM_WIDE", "1"}});

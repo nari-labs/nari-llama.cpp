@@ -13871,9 +13871,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // Trellis products at the Qwen3.8-27B NariQ FFN shape (5120 -> 17408, Hadamard blocks of 128 in and 1024 out)
     // for decode, speculative verify and a small batch
     for (ggml_type type : {GGML_TYPE_TRL3, GGML_TYPE_TRL4}) {
-        for (int64_t t : {1, 2, 3, 4, 16}) {
+        for (int64_t t : {1, 2, 3, 4, 5, 6, 8, 16}) {
             test_cases.emplace_back(new test_trellis(type, 5120, 17408, t, {1, 1024, 1}, {1, 128, 1}));
-            if (t == 1 || t == 4) {
+            if (t == 1 || t == 4 || t == 6) {
                 test_cases.emplace_back(new test_trellis(type, 17408, 5120, t, {1, 128, 1}, {1, 1024, 1}));
             }
         }

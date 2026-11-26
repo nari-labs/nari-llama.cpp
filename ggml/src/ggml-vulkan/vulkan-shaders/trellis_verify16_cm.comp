@@ -13,6 +13,8 @@
 // signed bytes (state value - 2, so that it fits int8 as byte sum - 128) and one 16 x 16 x 16 product multiplies it
 // with up to 16 token columns of int8 activations from trellis_quant.comp (packed layout, one scale per 16 inputs).
 // The accumulator starts at 2 x the sum of each token's activations, which restores the -126 of the state values.
+// TRELLIS_VERIFY_I32 (activations from trellis_quant_i32: tile scales folded in, one int8 scale per 32 inputs) stores
+// the exact state values as signed bytes, needs no bias, and adds the products of two tiles in int32 before scaling.
 
 #include "trellis_decode.glsl"
 
@@ -54,7 +56,12 @@ uint pack_signed_weights(uvec4 states) {
                     dotPacked4x8EXT(trellis_bytes4(states.y), 0x40404040u);
     const uint hi = (dotPacked4x8EXT(trellis_bytes4(states.z), 0x01010101u) >> 2) +
                     dotPacked4x8EXT(trellis_bytes4(states.w), 0x40404040u);
+#ifdef TRELLIS_VERIFY_I32
+    // Adding 2 cannot carry between bytes: byte sums are at most 252.
+    return ((lo | (hi << 16)) + 0x02020202u) ^ 0x80808080u;
+#else
     return (lo | (hi << 16)) ^ 0x80808080u;
+#endif
 }
 
 void sync_tile() {
@@ -78,6 +85,69 @@ void main() {
 
     FACC sum0 = FACC(0.0);
     FACC sum1 = FACC(0.0);
+#ifdef TRELLIS_VERIFY_I32
+    const uint blocks = tile_k / 2;
+    const uint bchunk = (blocks + gl_NumWorkGroups.y - 1) / gl_NumWorkGroups.y;
+    const uint bend = min(blocks, (part + 1) * bchunk);
+    for (uint block = part * bchunk + sg; block < bend; block += 4) {
+        IACC dots0 = IACC(0);
+        IACC dots1 = IACC(0);
+        [[unroll]] for (uint j = 0; j < 2; ++j) {
+            const uint col = 2 * block + j;
+            [[unroll]] for (uint r = 0; r < ROWS; ++r) {
+                if (r < row_tiles) {
+                    uvec4 lo, hi;
+                    trellis_states8_from(trellis_load8(((row_tile0 + r) * tile_k + col) * TILE_WORDS, word_index), 8 * lane, lo, hi);
+                    weight_tile[weight_base + 64 * r + lane] = pack_signed_weights(lo);
+                    weight_tile[weight_base + 64 * r + 32 + lane] = pack_signed_weights(hi);
+                }
+            }
+            if (lane < MAX_TOKENS) {
+                uvec4 words = uvec4(0);
+                if (lane < p.batch) {
+                    words = packed4[lane * tile_k + col];
+                }
+                [[unroll]] for (uint i = 0; i < 4; ++i) {
+                    act_tile[base + 4 * lane + i] = words[i];
+                }
+            }
+            sync_tile();
+            coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+            coopMatLoad(b, act_tile, base, 4, gl_CooperativeMatrixLayoutColumnMajor);
+            {
+                coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+                coopMatLoad(a, weight_tile, weight_base, 4, gl_CooperativeMatrixLayoutRowMajor);
+                dots0 = coopMatMulAdd(a, b, dots0);
+            }
+            if (ROWS > 1 && row_tiles > 1) {
+                coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+                coopMatLoad(a, weight_tile, weight_base + 64, 4, gl_CooperativeMatrixLayoutRowMajor);
+                dots1 = coopMatMulAdd(a, b, dots1);
+            }
+            sync_tile();
+        }
+        // one scale per token for the 32 inputs of the block
+        if (lane < MAX_TOKENS) {
+            tile_scales[16 * sg + lane] = lane < p.batch ? uintBitsToFloat(qmeta[meta_base + lane * blocks + block].y) : 0.0;
+        }
+        sync_tile();
+        FACC factors;
+        coopMatLoad(factors, tile_scales, 16 * sg, 0, gl_CooperativeMatrixLayoutRowMajor);
+        {
+            FACC values = FACC(dots0);
+            [[unroll]] for (uint i = 0; i < sum0.length(); ++i) {
+                sum0[i] = fma(values[i], factors[i], sum0[i]);
+            }
+        }
+        if (ROWS > 1) {
+            FACC values = FACC(dots1);
+            [[unroll]] for (uint i = 0; i < sum1.length(); ++i) {
+                sum1[i] = fma(values[i], factors[i], sum1[i]);
+            }
+        }
+        sync_tile();
+    }
+#else
     for (uint col = part * chunk + sg; col < end; col += 4) {
         [[unroll]] for (uint r = 0; r < ROWS; ++r) {
             if (r < row_tiles) {
@@ -119,6 +189,8 @@ void main() {
         MMA(1, sum1)
         sync_tile();
     }
+
+#endif
 
     coopMatStore(sum0, result_tile, sg * 256 * ROWS, 16, gl_CooperativeMatrixLayoutColumnMajor);
     if (ROWS > 1) {
