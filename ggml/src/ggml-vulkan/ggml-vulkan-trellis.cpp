@@ -242,10 +242,20 @@ static bool ggml_vk_trellis_chain_enabled() {
 }
 
 void ggml_vk_trellis_plan_chains(ggml_backend_vk_context * ctx, const ggml_cgraph * graph) {
-    ctx->trellis_raw_out.clear();
-    ctx->trellis_chain_glu.clear();
-    ctx->trellis_chain_in.clear();
+    if (!ctx->trellis_raw_out.empty()) {
+        ctx->trellis_raw_out.clear();
+        ctx->trellis_chain_glu.clear();
+        ctx->trellis_chain_in.clear();
+    }
     if (!ggml_vk_trellis_chain_enabled() || !ctx->device->pipeline_trellis_chain) {
+        return;
+    }
+    // decode and verify graphs have no candidate: skip the use count on the CPU
+    bool candidate = false;
+    for (int i = 0; i < graph->n_nodes && !candidate; ++i) {
+        candidate = graph->nodes[i]->op == GGML_OP_GLU && ggml_nrows(graph->nodes[i]) > 16;
+    }
+    if (!candidate) {
         return;
     }
     std::unordered_map<const ggml_tensor *, int> uses;
