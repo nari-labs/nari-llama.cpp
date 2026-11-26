@@ -47,16 +47,19 @@ void main() {
         }
     }
     const float inv = amax > 0.0 ? 127.0 / amax : 0.0;
+    int sum = 0;
     for (uint j = 0; j < 2; ++j) {
         const float inv_scaled = inv * float(scales[p.scale_offset + g0 + j]);
         [[unroll]] for (uint lq = 0; lq < 4; ++lq) {
             const uint i = base + j * 16 + 2 * lq;
             const ivec4 q = clamp(ivec4(round(vec4(x[i], x[i + 1], x[i + 8], x[i + 9]) * inv_scaled)), -127, 127);
+            sum += q.x + q.y + q.z + q.w;
             const uvec4 bytes = uvec4(q) & 255u;
             packed[(token * groups + g0 + j) * 4 + lq] = bytes.x | (bytes.y << 8) | (bytes.z << 16) | (bytes.w << 24);
         }
     }
-    qmeta[p.batch * groups * 2 + token * (groups / 2) + block] = uvec2(0, floatBitsToUint(amax / 127.0));
+    // the sum of the block's 32 int8 values, for the bias of trellis_verify16_cm.comp
+    qmeta[p.batch * groups * 2 + token * (groups / 2) + block] = uvec2(uint(sum), floatBitsToUint(amax / 127.0));
 #else
     const uint g = gl_GlobalInvocationID.x;
     const uint token = gl_GlobalInvocationID.y;

@@ -13,8 +13,9 @@
 // signed bytes (state value - 2, so that it fits int8 as byte sum - 128) and one 16 x 16 x 16 product multiplies it
 // with up to 16 token columns of int8 activations from trellis_quant.comp (packed layout, one scale per 16 inputs).
 // The accumulator starts at 2 x the sum of each token's activations, which restores the -126 of the state values.
-// TRELLIS_VERIFY_I32 (activations from trellis_quant_i32: tile scales folded in, one int8 scale per 32 inputs) stores
-// the exact state values as signed bytes, needs no bias, and adds the products of two tiles in int32 before scaling.
+// TRELLIS_VERIFY_I32 (activations from trellis_quant_i32: tile scales folded in, one int8 scale per 32 inputs, and the
+// sum of each block's int8 values) adds the products of two tiles in int32 before scaling, with the same bias of
+// 2 x the sum of the block's activations.
 
 #include "trellis_decode.glsl"
 
@@ -52,16 +53,17 @@ shared float result_tile[4 * 256 * ROWS];
 // with 0x40404040 the byte sum times 256: two states land in two bytes with one shift. Byte sums are at most 252, so
 // no byte carries into the next.
 uint pack_signed_weights(uvec4 states) {
+#ifdef TRELLIS_VERIFY_I32
+    // the byte sum of the first state of each pair accumulates into the dot product of the second
+    const uint lo = dotPacked4x8AccSatEXT(trellis_bytes4(states.y), 0x40404040u, dotPacked4x8EXT(trellis_bytes(states.x), 0x01010101u));
+    const uint hi = dotPacked4x8AccSatEXT(trellis_bytes4(states.w), 0x40404040u, dotPacked4x8EXT(trellis_bytes(states.z), 0x01010101u));
+#else
     const uint lo = (dotPacked4x8EXT(trellis_bytes4(states.x), 0x01010101u) >> 2) +
                     dotPacked4x8EXT(trellis_bytes4(states.y), 0x40404040u);
     const uint hi = (dotPacked4x8EXT(trellis_bytes4(states.z), 0x01010101u) >> 2) +
                     dotPacked4x8EXT(trellis_bytes4(states.w), 0x40404040u);
-#ifdef TRELLIS_VERIFY_I32
-    // Adding 2 cannot carry between bytes: byte sums are at most 252.
-    return ((lo | (hi << 16)) + 0x02020202u) ^ 0x80808080u;
-#else
-    return (lo | (hi << 16)) ^ 0x80808080u;
 #endif
+    return (lo | (hi << 16)) ^ 0x80808080u;
 }
 
 void sync_tile() {
@@ -90,8 +92,19 @@ void main() {
     const uint bchunk = (blocks + gl_NumWorkGroups.y - 1) / gl_NumWorkGroups.y;
     const uint bend = min(blocks, (part + 1) * bchunk);
     for (uint block = part * bchunk + sg; block < bend; block += 4) {
-        IACC dots0 = IACC(0);
-        IACC dots1 = IACC(0);
+        // per token column: the scale of the block and its bias, 2 x the sum of its int8 activations
+        if (lane < MAX_TOKENS) {
+            uvec2 meta = uvec2(0);
+            if (lane < p.batch) {
+                meta = qmeta[meta_base + lane * blocks + block];
+            }
+            tile_scales[16 * sg + lane] = uintBitsToFloat(meta.y);
+            tile_bias[16 * sg + lane] = 2 * int(meta.x);
+        }
+        sync_tile();
+        IACC dots0;
+        coopMatLoad(dots0, tile_bias, 16 * sg, 0, gl_CooperativeMatrixLayoutRowMajor);
+        IACC dots1 = dots0;
         [[unroll]] for (uint j = 0; j < 2; ++j) {
             const uint col = 2 * block + j;
             [[unroll]] for (uint r = 0; r < ROWS; ++r) {
@@ -126,11 +139,6 @@ void main() {
             }
             sync_tile();
         }
-        // one scale per token for the 32 inputs of the block
-        if (lane < MAX_TOKENS) {
-            tile_scales[16 * sg + lane] = lane < p.batch ? uintBitsToFloat(qmeta[meta_base + lane * blocks + block].y) : 0.0;
-        }
-        sync_tile();
         FACC factors;
         coopMatLoad(factors, tile_scales, 16 * sg, 0, gl_CooperativeMatrixLayoutRowMajor);
         {
