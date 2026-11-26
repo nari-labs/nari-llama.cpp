@@ -373,8 +373,9 @@ void ggml_vk_trellis(ggml_backend_vk_context * ctx, vk_context & subctx, const g
             const bool packed = batch > 1 && packed_enabled && packed_product && ctx->device->pipeline_trellis_quant_packed;
             const bool use_verify_cm = packed && verify_cm_enabled && verify_cm;
             static const bool verify_i32_enabled = [] {
+                // GGML_VK_TRELLIS_VERIFY_I32=0 keeps one scale per 16 inputs and float accumulation
                 const char * opt = std::getenv("GGML_VK_TRELLIS_VERIFY_I32");
-                return opt && std::strcmp(opt, "1") == 0;
+                return !opt || std::strcmp(opt, "0") != 0;
             }();
             // 2-4 tokens: trellis_verify_cm, 5-16 tokens: trellis_verify16_cm, both with one int8 scale per 32 inputs
             auto & verify_i32 = batch > VK_TRELLIS_Q8_TOKENS ? ctx->device->pipeline_trellis_verify16_i32_cm[bits]
