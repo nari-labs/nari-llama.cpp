@@ -13878,6 +13878,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
     }
+    // prompt batch (trellis_mm_big.comp in the Vulkan path)
+    test_cases.emplace_back(new test_trellis(GGML_TYPE_TRL3, 5120, 17408, 512, {1, 1024, 1}, {1, 128, 1}));
+    test_cases.emplace_back(new test_trellis(GGML_TYPE_TRL3, 17408, 5120, 512, {1, 128, 1}, {1, 1024, 1}));
     // the 48-row delta-net projections and one band of the output head (5120 -> 15488)
     for (int64_t t : {1, 4}) {
         test_cases.emplace_back(new test_trellis(GGML_TYPE_TRL5, 5120, 48, t, {0, 0, 1}, {1, 128, 1}));

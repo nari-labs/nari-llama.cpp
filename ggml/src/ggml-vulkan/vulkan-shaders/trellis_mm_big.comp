@@ -30,6 +30,7 @@ layout(push_constant) uniform Parameters {
     uint n;
     uint batch;
     uint scale_offset;
+    uint chunk_stride;
 } p;
 
 layout(local_size_x = 256) in;
@@ -68,8 +69,10 @@ void main() {
     const bool decode_live = sg < row_tiles;
     const uint decode_base = (row_tile0 + sg) * tile_k;
     const uvec4 word_index = trellis_words8(8 * lane);
+    // workgroup z: 256-token chunk of a launch that covers two chunks (prepared activations p.chunk_stride uvec4 apart)
+    const uint chunk_z = gl_WorkGroupID.z;
     // this thread copies the 16 inputs of token tid (two uvec4 of FP16)
-    const uint act_row = tid * (p.k / 8);
+    const uint act_row = chunk_z * p.chunk_stride + tid * (p.k / 8);
 
     // k split over gl_NumWorkGroups.y workgroups for products with few outputs: each writes its partial sums to its
     // own slice of y, which trellis_reduce adds up
@@ -148,12 +151,12 @@ void main() {
     // full 256-token chunks
     const uint token0 = 64 * wn;
     ACC f0, f1, f2, f3;
-    const uint scale_base = TOKENS * p.k / 2;
+    const uint scale_base = 4 * chunk_z * p.chunk_stride + TOKENS * p.k / 2;
     coopMatLoad(f0, inv_m, scale_base + token0, 0, gl_CooperativeMatrixLayoutRowMajor);
     coopMatLoad(f1, inv_m, scale_base + token0 + 16, 0, gl_CooperativeMatrixLayoutRowMajor);
     coopMatLoad(f2, inv_m, scale_base + token0 + 32, 0, gl_CooperativeMatrixLayoutRowMajor);
     coopMatLoad(f3, inv_m, scale_base + token0 + 48, 0, gl_CooperativeMatrixLayoutRowMajor);
-    const uint out_base = (k_part * p.batch + token0) * p.n + (row_tile0 + 4 * wm) * 16;
+    const uint out_base = (k_part * p.batch + TOKENS * chunk_z + token0) * p.n + (row_tile0 + 4 * wm) * 16;
 #define STORE(I, T, C, F) \
     if (4 * wm + I < row_tiles) { \
         [[unroll]] for (uint e = 0; e < C.length(); ++e) { \

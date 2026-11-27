@@ -553,48 +553,117 @@ void ggml_vk_trellis(ggml_backend_vk_context * ctx, vk_context & subctx, const g
                    q8_size > 0 && ctx->trellis_scratch->size >= 2 * stride + q8_size) {
             // Prepare FP16 activations with the tile scales and a power-of-two range per token.
             vk_subbuffer c = { ctx->trellis_scratch, 2 * stride, q8_size };
-            if (prep_in) {
-                vk_trellis_prep_in prep_pc = { k, batch, pc.first, offset(x), pc.strides[0], offset(pre), offset(pin),
-                                               pin != nullptr, offset(scales) };
-                auto & prep = ctx->device->pipeline_trellis_prep16_in;
-                ggml_pipeline_request_descriptor_sets(ctx, prep, 1);
-                ggml_vk_dispatch_pipeline(ctx, subctx, prep, { x_buf, pre_buf, pin_buf, scale_buf, c }, prep_pc,
-                                          { VK_TRELLIS_WIDE_BATCH, 1, 1 });
-            } else {
-                auto & prep = wide_chunk ? ctx->device->pipeline_trellis_prep16_wide : ctx->device->pipeline_trellis_prep16;
-                ggml_pipeline_request_descriptor_sets(ctx, prep, 1);
-                ggml_vk_dispatch_pipeline(ctx, subctx, prep, { a, scale_buf, c }, vk_trellis_product{ k, n, batch, offset(scales) },
-                                          { wide_chunk ? VK_TRELLIS_WIDE_BATCH : VK_TRELLIS_BATCH, 1, 1 });
+            // default (GGML_VK_TRELLIS_MM_PAIR=0 turns it off): two 256-token chunks in one 128 x 256 launch (workgroup z).
+            // The RX 9070 runs one such workgroup per CU (180 VGPRs), 56 at a time: gate and up (17408 outputs, 136
+            // workgroups) take 3 rounds per chunk with the last one under half full, 5 rounds for both chunks together;
+            // down (5120 outputs, k split in 2) 2 rounds of half length per chunk, 3 for both. The first chunk's
+            // activations go right before c, at the end of b; the products go to the start of the scratch (a and b),
+            // free when the input comes from prep_in or from the chain.
+            static const bool pair_enabled = [] { const char * opt = std::getenv("GGML_VK_TRELLIS_MM_PAIR"); return !opt || std::strcmp(opt, "0") != 0; }();
+            static const bool pair_big = [] { const char * opt = std::getenv("GGML_VK_TRELLIS_MM_BIG"); return !opt || std::strcmp(opt, "0") != 0; }();
+            static const bool pair_out128 = [] { const char * opt = std::getenv("GGML_VK_TRELLIS_OUT128"); return !opt || std::strcmp(opt, "0") != 0; }();
+            static const uint32_t pair_split_below = [] { const char * opt = std::getenv("GGML_VK_TRELLIS_MM_BIG_SPLIT"); return opt ? uint32_t(std::atoi(opt)) : 56u; }();
+            const uint32_t pair_tokens = 2 * VK_TRELLIS_WIDE_BATCH, pair_groups = CEIL_DIV(n, 128);
+            const size_t pair_room = 2 * stride >= q8_size ? 2 * stride - q8_size : 0;
+            const size_t pair_slice = sizeof(float) * size_t(n) * pair_tokens;
+            uint32_t pair_splits = 1;
+            if (pair_groups < pair_split_below) {
+                pair_splits = std::min<uint32_t>({ 16, CEIL_DIV(64, pair_groups), k / 256, uint32_t(pair_room / pair_slice) });
+                pair_splits = std::max<uint32_t>(pair_splits, 1);
             }
-            ggml_vk_sync_buffers(ctx, subctx);
-            // GGML_VK_TRELLIS_MM_RESIDUAL=1: also multiply the FP16 rounding residuals of the activations
-            auto & fp16_product = ggml_vk_trellis_residual_enabled() && ctx->device->pipeline_trellis_mm_res_cm1[bits]
-                                ? ctx->device->pipeline_trellis_mm_res_cm1[bits] : ctx->device->pipeline_trellis_mm_cm1[bits];
-            // GGML_VK_TRELLIS_MM_BIG=0 turns off the default 128 outputs x 256 tokens per workgroup (trellis_mm_big.comp) for wide chunks of
-            // products with at least GGML_VK_TRELLIS_MM_BIG_MIN such workgroups (default 0)
-            static const bool big_enabled = [] { const char * opt = std::getenv("GGML_VK_TRELLIS_MM_BIG"); return !opt || std::strcmp(opt, "0") != 0; }();
-            static const uint32_t big_min_groups = [] { const char * opt = std::getenv("GGML_VK_TRELLIS_MM_BIG_MIN"); return opt ? uint32_t(std::atoi(opt)) : 0u; }();
-            const bool big = wide_chunk && big_enabled && ctx->device->pipeline_trellis_mm_big_cm1[bits] &&
-                             CEIL_DIV(n, 128) >= big_min_groups;
-            auto & product = big ? ctx->device->pipeline_trellis_mm_big_cm1[bits] :
-                             wide_chunk ? ctx->device->pipeline_trellis_mm_wide_cm1[bits] : fp16_product;
-            ggml_pipeline_request_descriptor_sets(ctx, product, 1);
-            // few outputs (the 48-row delta-net projections: 2 workgroups): split k as in the int8 product
-            const uint32_t groups = CEIL_DIV(n, big ? 128 : 64), tiles = k / 16;
-            static const uint32_t big_split_below = [] { const char * opt = std::getenv("GGML_VK_TRELLIS_MM_BIG_SPLIT"); return opt ? uint32_t(std::atoi(opt)) : 56u; }();
-            uint32_t splits = 1;
-            if (groups < (big ? big_split_below : 32u)) {
-                splits = std::min<uint32_t>({ 16, CEIL_DIV(64, groups), tiles / 16, uint32_t(stride / (sizeof(float) * n * batch)) });
-                splits = std::max<uint32_t>(splits, 1);
-            }
-            raw_written = raw_out && splits == 1;
-            ggml_vk_dispatch_pipeline(ctx, subctx, product, { w_buf, scale_buf, c, raw_written ? raw_dst : b },
-                                      vk_trellis_product{ k, n, batch, offset(scales) }, { n, splits, 1 });
-            if (splits > 1) {
+            const bool pair_out = raw_out ? pair_splits == 1 :
+                                  pair_out128 && desc[0] == 1 && desc[1] == 128 && n % 128 == 0 && pout == nullptr &&
+                                  ctx->device->pipeline_trellis_out128 && pair_splits * pair_slice <= pair_room &&
+                                  CEIL_DIV(size_t(n) * pair_tokens, 64) <= ctx->device->properties.limits.maxComputeWorkGroupCount[0];
+            const bool pair = pair_enabled && pair_big && wide_chunk && (prep_in || pre_in) && remaining >= pair_tokens &&
+                              ctx->device->pipeline_trellis_mm_big_cm1[bits] && stride >= q8_size && pair_out;
+            if (pair) {
+                const vk_subbuffer c0 = { ctx->trellis_scratch, 2 * stride - q8_size, q8_size };
+                if (prep_in) {
+                    vk_trellis_prep_in prep_pc = { k, batch, pc.first, offset(x), pc.strides[0], offset(pre), offset(pin),
+                                                   pin != nullptr, offset(scales) };
+                    auto & prep = ctx->device->pipeline_trellis_prep16_in;
+                    ggml_pipeline_request_descriptor_sets(ctx, prep, 2);
+                    ggml_vk_dispatch_pipeline(ctx, subctx, prep, { x_buf, pre_buf, pin_buf, scale_buf, c0 }, prep_pc,
+                                              { VK_TRELLIS_WIDE_BATCH, 1, 1 });
+                    prep_pc.first = pc.first + VK_TRELLIS_WIDE_BATCH;
+                    ggml_vk_dispatch_pipeline(ctx, subctx, prep, { x_buf, pre_buf, pin_buf, scale_buf, c }, prep_pc,
+                                              { VK_TRELLIS_WIDE_BATCH, 1, 1 });
+                } else {
+                    // a is this chunk's rotated input, straight from the SwiGLU output
+                    const vk_subbuffer a1 = { a.buffer, a.offset + size_t(VK_TRELLIS_WIDE_BATCH) * k * sizeof(float), a.size };
+                    auto & prep = ctx->device->pipeline_trellis_prep16_wide;
+                    ggml_pipeline_request_descriptor_sets(ctx, prep, 2);
+                    ggml_vk_dispatch_pipeline(ctx, subctx, prep, { a, scale_buf, c0 }, vk_trellis_product{ k, n, batch, offset(scales) },
+                                              { VK_TRELLIS_WIDE_BATCH, 1, 1 });
+                    ggml_vk_dispatch_pipeline(ctx, subctx, prep, { a1, scale_buf, c }, vk_trellis_product{ k, n, batch, offset(scales) },
+                                              { VK_TRELLIS_WIDE_BATCH, 1, 1 });
+                }
                 ggml_vk_sync_buffers(ctx, subctx);
-                auto & reduce = ctx->device->pipeline_trellis_reduce;
-                ggml_pipeline_request_descriptor_sets(ctx, reduce, 1);
-                ggml_vk_dispatch_pipeline(ctx, subctx, reduce, { b }, vk_trellis_product{ splits, n, batch, 0 }, { n * batch, 1, 1 });
+                ggml_vk_trellis_stamp(ctx, subctx, TRELLIS_PROFILE_ROTATE_IN);
+                const vk_subbuffer act2 = { ctx->trellis_scratch, 2 * stride - q8_size, 2 * q8_size };
+                const vk_subbuffer out2 = raw_out ?
+                    vk_subbuffer{ dst_buf.buffer, dst_buf.offset + size_t(pc.first) * n * sizeof(float), pair_slice } :
+                    vk_subbuffer{ ctx->trellis_scratch, 0, pair_splits * pair_slice };
+                auto & product = ctx->device->pipeline_trellis_mm_big_cm1[bits];
+                ggml_pipeline_request_descriptor_sets(ctx, product, 1);
+                ggml_vk_dispatch_pipeline(ctx, subctx, product, { w_buf, scale_buf, act2, out2 },
+                                          vk_trellis_product{ k, n, pair_tokens, offset(scales), uint32_t(q8_size / 16) },
+                                          { n, pair_splits, 2 });
+                if (pair_splits > 1) {
+                    ggml_vk_sync_buffers(ctx, subctx);
+                    auto & reduce = ctx->device->pipeline_trellis_reduce;
+                    ggml_pipeline_request_descriptor_sets(ctx, reduce, 1);
+                    ggml_vk_dispatch_pipeline(ctx, subctx, reduce, { out2 }, vk_trellis_product{ pair_splits, n, pair_tokens, 0 },
+                                              { n * pair_tokens, 1, 1 });
+                }
+                batch = pair_tokens;
+                b = { ctx->trellis_scratch, 0, pair_slice };
+                raw_written = raw_out;
+            } else {
+                if (prep_in) {
+                    vk_trellis_prep_in prep_pc = { k, batch, pc.first, offset(x), pc.strides[0], offset(pre), offset(pin),
+                                                   pin != nullptr, offset(scales) };
+                    auto & prep = ctx->device->pipeline_trellis_prep16_in;
+                    ggml_pipeline_request_descriptor_sets(ctx, prep, 1);
+                    ggml_vk_dispatch_pipeline(ctx, subctx, prep, { x_buf, pre_buf, pin_buf, scale_buf, c }, prep_pc,
+                                              { VK_TRELLIS_WIDE_BATCH, 1, 1 });
+                } else {
+                    auto & prep = wide_chunk ? ctx->device->pipeline_trellis_prep16_wide : ctx->device->pipeline_trellis_prep16;
+                    ggml_pipeline_request_descriptor_sets(ctx, prep, 1);
+                    ggml_vk_dispatch_pipeline(ctx, subctx, prep, { a, scale_buf, c }, vk_trellis_product{ k, n, batch, offset(scales) },
+                                              { wide_chunk ? VK_TRELLIS_WIDE_BATCH : VK_TRELLIS_BATCH, 1, 1 });
+                }
+                ggml_vk_sync_buffers(ctx, subctx);
+                // GGML_VK_TRELLIS_MM_RESIDUAL=1: also multiply the FP16 rounding residuals of the activations
+                auto & fp16_product = ggml_vk_trellis_residual_enabled() && ctx->device->pipeline_trellis_mm_res_cm1[bits]
+                                    ? ctx->device->pipeline_trellis_mm_res_cm1[bits] : ctx->device->pipeline_trellis_mm_cm1[bits];
+                // GGML_VK_TRELLIS_MM_BIG=0 turns off the default 128 outputs x 256 tokens per workgroup (trellis_mm_big.comp) for wide chunks of
+                // products with at least GGML_VK_TRELLIS_MM_BIG_MIN such workgroups (default 0)
+                static const bool big_enabled = [] { const char * opt = std::getenv("GGML_VK_TRELLIS_MM_BIG"); return !opt || std::strcmp(opt, "0") != 0; }();
+                static const uint32_t big_min_groups = [] { const char * opt = std::getenv("GGML_VK_TRELLIS_MM_BIG_MIN"); return opt ? uint32_t(std::atoi(opt)) : 0u; }();
+                const bool big = wide_chunk && big_enabled && ctx->device->pipeline_trellis_mm_big_cm1[bits] &&
+                                 CEIL_DIV(n, 128) >= big_min_groups;
+                auto & product = big ? ctx->device->pipeline_trellis_mm_big_cm1[bits] :
+                                 wide_chunk ? ctx->device->pipeline_trellis_mm_wide_cm1[bits] : fp16_product;
+                ggml_pipeline_request_descriptor_sets(ctx, product, 1);
+                // few outputs (the 48-row delta-net projections: 2 workgroups): split k as in the int8 product
+                const uint32_t groups = CEIL_DIV(n, big ? 128 : 64), tiles = k / 16;
+                static const uint32_t big_split_below = [] { const char * opt = std::getenv("GGML_VK_TRELLIS_MM_BIG_SPLIT"); return opt ? uint32_t(std::atoi(opt)) : 56u; }();
+                uint32_t splits = 1;
+                if (groups < (big ? big_split_below : 32u)) {
+                    splits = std::min<uint32_t>({ 16, CEIL_DIV(64, groups), tiles / 16, uint32_t(stride / (sizeof(float) * n * batch)) });
+                    splits = std::max<uint32_t>(splits, 1);
+                }
+                raw_written = raw_out && splits == 1;
+                ggml_vk_dispatch_pipeline(ctx, subctx, product, { w_buf, scale_buf, c, raw_written ? raw_dst : b },
+                                          vk_trellis_product{ k, n, batch, offset(scales) }, { n, splits, 1 });
+                if (splits > 1) {
+                    ggml_vk_sync_buffers(ctx, subctx);
+                    auto & reduce = ctx->device->pipeline_trellis_reduce;
+                    ggml_pipeline_request_descriptor_sets(ctx, reduce, 1);
+                    ggml_vk_dispatch_pipeline(ctx, subctx, reduce, { b }, vk_trellis_product{ splits, n, batch, 0 }, { n * batch, 1, 1 });
+                }
             }
         } else {
             if (fuse_in) {

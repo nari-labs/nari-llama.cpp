@@ -24,6 +24,9 @@ struct vk_trellis_fused {
 
 struct vk_trellis_product {
     uint32_t k, n, batch, scale_offset;
+    // trellis_mm_big.comp: distance in uvec4 between the prepared activations of consecutive 256-token chunks
+    // (workgroup z), when one launch multiplies two chunks
+    uint32_t chunk_stride;
 };
 
 struct vk_trellis_transform {
