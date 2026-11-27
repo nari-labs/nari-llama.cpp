@@ -1,0 +1,149 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_integer_dot_product : require
+#pragma use_vulkan_memory_model
+
+#include "trellis_decode.glsl"
+
+layout(local_size_x = 128) in;
+layout(binding = 2) readonly buffer Packed { uint packed[]; };
+layout(binding = 2) readonly buffer Meta { uvec2 qmeta[]; };
+layout(binding = 3) writeonly buffer Result { float y[]; };
+
+layout(push_constant) uniform Parameters {
+    uint k;
+    uint n;
+    uint batch;
+    uint scale_offset;
+} p;
+
+// Each subgroup stages a separate input tile and keeps its partial output.
+shared uint weight_tile[4 * 64];
+shared uint act_tile[4 * 64];
+shared float tile_scales[4 * 16];
+shared float result_tile[4 * 256];
+
+#define IACC coopmat<int, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define FACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+
+uint pack_signed_weights(uvec4 states) {
+#ifdef TRELLIS_VERIFY_I32
+    const uint lo = (dotPacked4x8EXT(trellis_bytes4(states.x), 0x01010101u) >> 2) +
+                    dotPacked4x8EXT(trellis_bytes4(states.y), 0x40404040u);
+    const uint hi = (dotPacked4x8EXT(trellis_bytes4(states.z), 0x01010101u) >> 2) +
+                    dotPacked4x8EXT(trellis_bytes4(states.w), 0x40404040u);
+    // Sums are at most 252. Adding 2 cannot carry between bytes.
+    return ((lo | (hi << 16)) + 0x02020202u) ^ 0x80808080u;
+#else
+    uint word = 0;
+    [[unroll]] for (uint j = 0; j < 4; ++j) {
+        const uint value = dotPacked4x8EXT(trellis_bytes(states[j]), 0x01010101u);
+        word |= ((value - 126u) & 255u) << (8 * j);
+    }
+    return word;
+#endif
+}
+
+void sync_tile() {
+    controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
+}
+
+void main() {
+    // k < 2^31: the shifted bit is always zero
+    trellis_hash_init(p.k >> 31);
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sg = gl_SubgroupID;
+    const uint base = sg * 64;
+    const uint result_base = sg * 256;
+    const uint tile_k = p.k / 16;
+    const uint meta_base = p.batch * tile_k * 2;
+    const uint part = gl_WorkGroupID.y;
+#ifdef TRELLIS_VERIFY_I32
+    const uint blocks = tile_k / 2;
+#else
+    const uint blocks = tile_k;
+#endif
+    const uint chunk = (blocks + gl_NumWorkGroups.y - 1) / gl_NumWorkGroups.y;
+    const uint end = min(blocks, (part + 1) * chunk);
+    const uint tile_base = gl_WorkGroupID.x * tile_k;
+    act_tile[base + lane] = 0;
+    act_tile[base + 32 + lane] = 0;
+    sync_tile();
+
+    FACC sum = FACC(0.0);
+    for (uint block = part * chunk + sg; block < end; block += 4) {
+        IACC dots = IACC(0);
+#ifdef TRELLIS_VERIFY_I32
+        for (uint j = 0; j < 2; ++j) {
+            const uint col = block * 2 + j;
+#else
+        {
+            const uint col = block;
+#endif
+            const uint tile = (tile_base + col) * TILE_WORDS;
+            uvec4 lo, hi;
+            if (BITS <= 4) {
+                trellis_states8(tile, 8 * lane, lo, hi);
+            } else {
+                lo = trellis_states4(tile, 8 * lane);
+                hi = trellis_states4(tile, 8 * lane + 4);
+            }
+            weight_tile[base + lane] = pack_signed_weights(lo);
+            weight_tile[base + 32 + lane] = pack_signed_weights(hi);
+
+            // Each output column holds four inputs of one token.
+            if (lane < 16) {
+                const uint t = lane / 4;
+                const uint index = (t * tile_k + col) * 4 + lane % 4;
+                float factor = 0.0;
+                if (t < p.batch) {
+                    act_tile[base + 4 * lane + lane % 4] = packed[index];
+#ifdef TRELLIS_VERIFY_I32
+                    factor = uintBitsToFloat(qmeta[meta_base + t * blocks + block].y);
+#else
+                    factor = float(scales[p.scale_offset + col]) * uintBitsToFloat(qmeta[meta_base + index].y);
+#endif
+                }
+                tile_scales[16 * sg + lane] = factor;
+            }
+            sync_tile();
+
+            coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+            coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+            coopMatLoad(a, weight_tile, base, 4, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b, act_tile, base, 4, gl_CooperativeMatrixLayoutColumnMajor);
+            dots = coopMatMulAdd(a, b, dots);
+#ifdef TRELLIS_VERIFY_I32
+            sync_tile();
+#endif
+        }
+        FACC values = FACC(dots);
+        FACC factors;
+        // All output rows use the same scale for each token.
+        coopMatLoad(factors, tile_scales, 16 * sg, 0, gl_CooperativeMatrixLayoutRowMajor);
+        [[unroll]] for (uint i = 0; i < sum.length(); ++i) {
+            sum[i] = fma(values[i], factors[i], sum[i]);
+        }
+        sync_tile();
+    }
+
+    coopMatStore(sum, result_tile, result_base, 16, gl_CooperativeMatrixLayoutColumnMajor);
+    barrier();
+    const uint token = gl_LocalInvocationID.x / 16;
+    const uint row = gl_LocalInvocationID.x % 16;
+    if (token < p.batch) {
+        const uint index = 64 * token + row;
+        float value = 0.0;
+        [[unroll]] for (uint j = 0; j < 4; ++j) {
+            [[unroll]] for (uint c = 0; c < 4; ++c) {
+                value += result_tile[256 * j + index + 16 * c];
+            }
+        }
+        y[(part * p.batch + token) * p.n + 16 * gl_WorkGroupID.x + row] = value;
+    }
+}

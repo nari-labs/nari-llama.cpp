@@ -62,6 +62,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <shared_mutex>
 #include <mutex>
 #include <future>
@@ -746,6 +747,7 @@ struct vk_device_struct {
     bool shader_64b_indexing;
 
     bool integer_dot_product;
+    bool integer_dot_product_packed_mixed;
     // 0: default, 1: force mmvq, -1: disable mmvq
     int32_t mmvq_mode;
 
@@ -763,6 +765,7 @@ struct vk_device_struct {
     bool coopmat_bf16_support {};
     bool coopmat_support_16x16x16_f16acc {};
     bool coopmat_support_16x16x16_f32acc {};
+    bool coopmat_support_16x16x16_s8 {};
     bool coopmat1_fa_support {};
     uint32_t coopmat_m;
     uint32_t coopmat_n;
@@ -880,6 +883,19 @@ struct vk_device_struct {
     vk_pipeline pipeline_set_rows_i64[2][GGML_TYPE_COUNT];
     vk_pipeline pipeline_norm_f32;
     vk_pipeline pipeline_group_norm_f32;
+    vk_pipeline pipeline_trellis_input, pipeline_trellis_output, pipeline_trellis_store_rows;
+    vk_pipeline pipeline_trellis_fused_in, pipeline_trellis_fused_in_q8, pipeline_trellis_fused_in_q8_packed, pipeline_trellis_fused_out;
+    vk_pipeline pipeline_trellis_block, pipeline_trellis_butterfly, pipeline_trellis_cross;
+    vk_pipeline pipeline_trellis_block_shuffle, pipeline_trellis_chain, pipeline_trellis_out128;
+    vk_pipeline pipeline_trellis_matvec[6], pipeline_trellis_matmul[6], pipeline_trellis_decode_rows[6];
+    vk_pipeline pipeline_trellis_matvec_q8[6], pipeline_trellis_matvec_q8x4[6], pipeline_trellis_quant, pipeline_trellis_reduce;
+    vk_pipeline pipeline_trellis_matvec_q8x4_packed[6], pipeline_trellis_quant_packed;
+    vk_pipeline pipeline_trellis_verify_cm[6], pipeline_trellis_verify_i32_cm[6], pipeline_trellis_quant_i32;
+    vk_pipeline pipeline_trellis_verify16_cm[6], pipeline_trellis_verify16_i32_cm[6];
+    vk_pipeline pipeline_trellis_matmul_cm1[6];
+    vk_pipeline pipeline_trellis_mm_cm1[6], pipeline_trellis_mm_res_cm1[6], pipeline_trellis_prep16;
+    vk_pipeline pipeline_trellis_mm_wide_cm1[6], pipeline_trellis_prep16_wide, pipeline_trellis_prep16_in;
+    vk_pipeline pipeline_trellis_mm_big_cm1[6];
     std::array<vk_pipeline, 3> pipeline_rms_norm_f32;
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_f32;
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_add_f32;
@@ -1294,6 +1310,7 @@ struct ggml_backend_vk_context {
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
+    vk_buffer trellis_scratch;
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
@@ -1360,6 +1377,14 @@ struct ggml_backend_vk_context {
     std::vector<int> query_node_idx;
     int32_t num_queries {};
     int32_t query_idx {};
+
+    // Extra timestamps for the stages within a Trellis operator.
+    uint32_t trellis_query_base {};
+    std::vector<uint8_t> trellis_query_stages;
+
+    // Trellis MLP chains of the current graph (ggml_vk_trellis_plan_chains): gate and up products that keep their raw
+    // output, the SwiGLU nodes that run trellis_chain.comp, and the down products that read an already rotated input
+    std::unordered_set<const ggml_tensor *> trellis_raw_out, trellis_chain_glu, trellis_chain_in;
 };
 
 struct ggml_backend_vk_buffer_context {

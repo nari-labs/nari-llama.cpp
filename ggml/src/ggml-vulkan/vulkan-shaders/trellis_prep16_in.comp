@@ -1,0 +1,120 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// The input stage, the input block transform (blocks of 128) and trellis_prep16.comp (wide layout) of a Trellis
+// prompt-batch product in one launch: one workgroup of 8 subgroups (32 lanes) per token. Each subgroup transforms
+// whole blocks in registers (lane l holds entries l, l + 32, l + 64 and l + 96 of a block: five shuffle steps, then two
+// steps between its own registers), then the token's largest scaled value sets its power of two as in
+// trellis_prep16.comp, and the FP16 activations go straight to the product.
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Parameters {
+    uint k;
+    uint batch;
+    uint first;
+    uint x_offset;
+    uint x_stride;
+    uint pre_offset;
+    uint gather_offset;
+    uint use_gather;
+    uint scale_offset;
+} p;
+
+layout(binding = 0) readonly buffer Input { float src[]; };
+layout(binding = 1) readonly buffer Pre { float pre[]; };
+layout(binding = 2) readonly buffer Gather { uint gather[]; };
+layout(binding = 3) readonly buffer Scales { float16_t scales[]; };
+layout(binding = 4) writeonly buffer Act { float16_t act[]; };
+layout(binding = 4) writeonly buffer ActScale { float inv_m[]; };
+
+const uint TOKENS = 256;
+const uint LEN = 128;
+// k up to 128 * 8 * MAX_BLOCKS
+const uint MAX_BLOCKS = 6;
+shared float amax_part[8];
+
+float shuffle_steps(float value, uint lane) {
+    [[unroll]] for (uint step = 1; step < 32; step *= 2) {
+        const float other = subgroupShuffleXor(value, step);
+        value = (lane & step) == 0 ? value + other : other - value;
+    }
+    return value;
+}
+
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sg = gl_SubgroupID;
+    const uint token = gl_WorkGroupID.x;
+    const uint base = token * p.k;
+    const uint scale_base = TOKENS * p.k / 2;
+    const uint blocks = p.k / LEN;
+    if (token >= p.batch) {
+        for (uint i = gl_LocalInvocationID.x; i < p.k; i += 256) {
+            act[base + i] = float16_t(0.0);
+        }
+        if (gl_LocalInvocationID.x == 0) {
+            inv_m[scale_base + token] = 0.0;
+        }
+        return;
+    }
+    const uint row = p.x_offset + (p.first + token) * p.x_stride;
+    const float norm = 1.0 / sqrt(float(LEN));
+
+    vec4 v[MAX_BLOCKS];
+    float amax = 0.0;
+    [[unroll]] for (uint r = 0; r < MAX_BLOCKS; ++r) {
+        const uint b = sg + 8 * r;
+        v[r] = vec4(0.0);
+        if (b < blocks) {
+            vec4 w;
+            [[unroll]] for (uint c = 0; c < 4; ++c) {
+                const uint idx = b * LEN + lane + 32 * c;
+                const uint j = p.use_gather != 0 ? gather[p.gather_offset + idx] : idx;
+                w[c] = shuffle_steps(src[row + j] * pre[p.pre_offset + idx], lane);
+            }
+            // steps 32 and 64 between the registers of the lane
+            w = vec4(w.x + w.y, w.x - w.y, w.z + w.w, w.z - w.w);
+            w = vec4(w.x + w.z, w.y + w.w, w.x - w.z, w.y - w.w);
+            [[unroll]] for (uint c = 0; c < 4; ++c) {
+                const uint idx = b * LEN + lane + 32 * c;
+                // the same rounding steps as the separate transform and trellis_prep16.comp
+                w[c] = (w[c] * norm) * float(scales[p.scale_offset + idx / 16]);
+                amax = max(amax, abs(w[c]));
+            }
+            v[r] = w;
+        }
+    }
+    amax = subgroupMax(amax);
+    if (lane == 0) {
+        amax_part[sg] = amax;
+    }
+    barrier();
+    amax = amax_part[0];
+    [[unroll]] for (uint s = 1; s < 8; ++s) {
+        amax = max(amax, amax_part[s]);
+    }
+    // m = 2^(14 - ceil(log2(amax))), so that amax * m <= 2^14 (trellis_prep16.comp)
+    int e = 0;
+    if (amax > 0.0) {
+        int ex;
+        frexp(amax, ex);
+        e = clamp(14 - ex, -100, 100);
+    }
+    const float m = ldexp(1.0, e);
+    [[unroll]] for (uint r = 0; r < MAX_BLOCKS; ++r) {
+        const uint b = sg + 8 * r;
+        if (b < blocks) {
+            [[unroll]] for (uint c = 0; c < 4; ++c) {
+                act[base + b * LEN + lane + 32 * c] = float16_t(v[r][c] * m);
+            }
+        }
+    }
+    if (gl_LocalInvocationID.x == 0) {
+        inv_m[scale_base + token] = ldexp(1.0, -e);
+    }
+}

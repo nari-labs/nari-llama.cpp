@@ -1,0 +1,85 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Parameters {
+    uint k;
+    uint n;
+    uint first;
+    uint offsets[7];
+    uint strides[3];
+    uint ne1;
+    uint ne2;
+    uint use_gather;
+    int row0;
+    uint vocab;
+} p;
+
+#if defined(TRELLIS_DECODE_ROWS)
+#include "trellis_decode.glsl"
+
+layout(binding = 2) readonly buffer Ids { int ids[]; };
+layout(binding = 3) readonly buffer Gather { int gather[]; };
+layout(binding = 4) writeonly buffer Decoded { float decoded[]; };
+#elif defined(TRELLIS_STORE_ROWS)
+layout(binding = 0) readonly buffer Decoded { float decoded[]; };
+layout(binding = 1) readonly buffer Ids { int ids[]; };
+layout(binding = 2) readonly buffer Gather { int gather[]; };
+layout(binding = 3) readonly buffer Pre { float pre[]; };
+layout(binding = 4) readonly buffer Post { float post[]; };
+layout(binding = 5) writeonly buffer Result { float dst[]; };
+#else
+layout(binding = 0) readonly buffer Input { float src[]; };
+layout(binding = 1) readonly buffer Scale { float scale[]; };
+layout(binding = 2) readonly buffer Gather { uint gather[]; };
+layout(binding = 3) writeonly buffer Output { float dst[]; };
+#endif
+
+#if defined(TRELLIS_DECODE_ROWS) || defined(TRELLIS_STORE_ROWS)
+int trellis_row(uint token) {
+    int row = ids[p.offsets[2] + token];
+    if (p.use_gather != 0) {
+        if (row < 0 || uint(row) >= p.vocab) {
+            return -1;
+        }
+        row = gather[p.offsets[3] + row] - p.row0;
+    }
+    return row;
+}
+#endif
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    const uint local_token = gl_WorkGroupID.y;
+    const uint token = p.first + local_token;
+    if (i >= p.k) {
+        return;
+    }
+#if defined(TRELLIS_DECODE_ROWS) || defined(TRELLIS_STORE_ROWS)
+    const int row = trellis_row(token);
+    const bool valid = row >= 0 && uint(row) < p.n;
+#if defined(TRELLIS_DECODE_ROWS)
+    float value = 0.0;
+    if (valid) {
+        const uint tile = p.offsets[0] + ((uint(row) / 16) * (p.k / 16) + i / 16) * TILE_WORDS;
+        value = trellis_value(tile, uint(row) % 16, i % 16) * float(scales[p.offsets[1] + i / 16]);
+    }
+    decoded[local_token * p.k + i] = value;
+#else
+    if (valid) {
+        dst[p.offsets[6] + token * p.strides[0] + i] = decoded[local_token * p.k + i] * (pre[p.offsets[4] + i] * post[p.offsets[5] + row]);
+    } else if (p.use_gather == 0) {
+        dst[p.offsets[6] + token * p.strides[0] + i] = 0.0;
+    }
+#endif
+#elif defined(TRELLIS_INPUT)
+    const uint j = p.use_gather != 0 ? gather[p.offsets[2] + i] : i;
+    const uint offset = (token % p.ne1) * p.strides[0] + (token / p.ne1 % p.ne2) * p.strides[1] + (token / (p.ne1 * p.ne2)) * p.strides[2];
+    dst[local_token * p.k + i] = src[p.offsets[0] + offset + j] * scale[p.offsets[1] + i];
+#else
+    const uint j = p.use_gather != 0 ? gather[p.offsets[2] + i] : i;
+    dst[p.offsets[3] + token * p.k + i] = src[local_token * p.k + j] * scale[p.offsets[1] + j];
+#endif
+}

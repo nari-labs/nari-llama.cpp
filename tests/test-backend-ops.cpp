@@ -2743,9 +2743,12 @@ struct test_trellis : public test_case {
         return v;
     }
 
-    // the CUDA kernels round the activations to FP16, with one scale per 128 inputs
+    // the CUDA kernels round the activations to FP16, with one scale per 128 inputs; the Vulkan decode and verify
+    // path (up to 16 tokens; up to 4 with GGML_VK_TRELLIS_VERIFY_CM=0) quantizes them to int8 with one scale per 16
+    // inputs (NMSE about 2e-5; full NariQ 3.0 bpw model, logits against the CPU: mean KL 4e-5, same top-1 at 31 of 31
+    // positions)
     double max_nmse_err() override {
-        return 1e-5;
+        return t <= 16 ? 5e-5 : 1e-5;
     }
 
     test_trellis(ggml_type type, int64_t k, int64_t n, int64_t t, trellis_side rows, trellis_side cols,
@@ -2795,8 +2798,9 @@ struct test_trellis_mlp : public test_case {
         return VARS_TO_STR5(type, n_embd, n_ff, t, block);
     }
 
+    // three products in a row: the int8 activations of the Vulkan path for up to 4 tokens (see test_trellis) add up
     double max_nmse_err() override {
-        return 1e-5;
+        return t <= 16 ? 2e-4 : 1e-5;
     }
 
     bool run_whole_graph() override { return true; }
@@ -2839,8 +2843,9 @@ struct test_trellis_group : public test_case {
         return VARS_TO_STR2(k, t);
     }
 
+    // int8 activations of the Vulkan path for up to 4 tokens, see test_trellis
     double max_nmse_err() override {
-        return 1e-5;
+        return t <= 16 ? 5e-5 : 1e-5;
     }
 
     bool run_whole_graph() override { return true; }
@@ -13862,6 +13867,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // Qwen3.8-Flash-Next pooled indexer prefill.
     test_cases.emplace_back(new test_lightning_indexer(128, 4, 1088, 1024, 1, 1, GGML_TYPE_F32));
     test_cases.emplace_back(new test_lightning_indexer(128, 4, 1088, 1024, 1, 1, GGML_TYPE_Q4_0));
+
+    // Trellis products at the Qwen3.8-27B NariQ FFN shape (5120 -> 17408, Hadamard blocks of 128 in and 1024 out)
+    // for decode, speculative verify and a small batch
+    for (ggml_type type : {GGML_TYPE_TRL3, GGML_TYPE_TRL4}) {
+        for (int64_t t : {1, 2, 3, 4, 5, 6, 8, 16}) {
+            test_cases.emplace_back(new test_trellis(type, 5120, 17408, t, {1, 1024, 1}, {1, 128, 1}));
+            if (t == 1 || t == 4 || t == 6) {
+                test_cases.emplace_back(new test_trellis(type, 17408, 5120, t, {1, 128, 1}, {1, 1024, 1}));
+            }
+        }
+    }
+    // prompt batch (trellis_mm_big.comp in the Vulkan path)
+    test_cases.emplace_back(new test_trellis(GGML_TYPE_TRL3, 5120, 17408, 512, {1, 1024, 1}, {1, 128, 1}));
+    test_cases.emplace_back(new test_trellis(GGML_TYPE_TRL3, 17408, 5120, 512, {1, 128, 1}, {1, 1024, 1}));
+    // the 48-row delta-net projections and one band of the output head (5120 -> 15488)
+    for (int64_t t : {1, 4}) {
+        test_cases.emplace_back(new test_trellis(GGML_TYPE_TRL5, 5120, 48, t, {0, 0, 1}, {1, 128, 1}));
+        test_cases.emplace_back(new test_trellis(GGML_TYPE_TRL2, 5120, 15488, t, {1, 128, 1}, {1, 128, 1}));
+    }
+
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {

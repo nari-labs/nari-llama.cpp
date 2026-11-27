@@ -1,0 +1,171 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_integer_dot_product : require
+#pragma use_vulkan_memory_model
+
+// Trellis prompt-batch product, 128 outputs x 256 tokens per workgroup (the layout of k_product_mm_128x256 in the
+// HIP pull request nari-labs/nari-llama.cpp#8). 8 subgroups in a 2 x 4 grid: each keeps 4 row tiles x 4 token tiles
+// of FP32 accumulators. For every 16 inputs each subgroup decodes one 16 x 16 weight tile into shared memory as exact
+// FP16 integers and the workgroup copies the FP16 activations of its 256 tokens (trellis_prep16.comp, wide layout:
+// tile scales and a power of two per token already applied); each subgroup then multiplies its 4 weight tiles with
+// its 4 token tiles from shared memory. Two shared buffers: the next code words and activations are read from global
+// memory while this step multiplies.
+//
+// The accumulators are separate variables, not an array: arrays of cooperative matrices written in a loop crash
+// the AMD proprietary Windows compiler.
+
+#include "trellis_decode.glsl"
+
+layout(binding = 2) readonly buffer Act { uvec4 act4[]; };
+layout(binding = 2) readonly buffer ActScale { float inv_m[]; };
+layout(binding = 3) writeonly buffer Result { float y[]; };
+
+layout(push_constant) uniform Parameters {
+    uint k;
+    uint n;
+    uint batch;
+    uint scale_offset;
+    uint chunk_stride;
+} p;
+
+layout(local_size_x = 256) in;
+
+const uint TOKENS = 256;
+const uint ROW_TILES = 8;
+
+// weights: [buffer][row tile][16 x 16 FP16, row-major, two per word]; activations: [buffer][token][16 FP16 inputs]
+// as two uvec4, so each 16-token tile is a column-major 16 x 16 matrix with a stride of two uvec4
+shared uint sw[2 * ROW_TILES * 128];
+shared uvec4 sx[2 * TOKENS * 2];
+
+#define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define ZERO ACC(0.0)
+
+// 4 x the value of a state as a float without an integer conversion (grid_value4 in nari-labs/nari-llama.cpp#7): the
+// byte sum of the masked hash (4 x the digit sum, at most 1008) added to the bits of 2^23 is the float 2^23 + 4 x sum,
+// and 2^23 + 4 x 126 = 8389112. Exact; |4 x value| <= 504 is also exact in FP16.
+float trellis_value4x(uint state) {
+    return uintBitsToFloat(dotPacked4x8AccSatEXT(trellis_bytes4(state), 0x01010101u, 0x4B000000u)) - 8389112.0;
+}
+#define BMAT coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define AMAT coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+
+void main() {
+    // k < 2^31: the shifted bit is always zero
+    trellis_hash_init(p.k >> 31);
+    const uint tid = gl_LocalInvocationID.x;
+    const uint sg = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint wm = sg / 4;
+    const uint wn = sg % 4;
+    const uint tile_k = p.k / 16;
+    const uint row_tile0 = ROW_TILES * gl_WorkGroupID.x;
+    const uint row_tiles = min(ROW_TILES, p.n / 16 - row_tile0);
+    const bool decode_live = sg < row_tiles;
+    const uint decode_base = (row_tile0 + sg) * tile_k;
+    const uvec4 word_index = trellis_words8(8 * lane);
+    // workgroup z: 256-token chunk of a launch that covers two chunks (prepared activations p.chunk_stride uvec4 apart)
+    const uint chunk_z = gl_WorkGroupID.z;
+    // this thread copies the 16 inputs of token tid (two uvec4 of FP16)
+    const uint act_row = chunk_z * p.chunk_stride + tid * (p.k / 8);
+
+    // k split over gl_NumWorkGroups.y workgroups for products with few outputs: each writes its partial sums to its
+    // own slice of y, which trellis_reduce adds up
+    const uint k_split = gl_NumWorkGroups.y;
+    const uint k_part = gl_WorkGroupID.y;
+    const uint chunk = (tile_k + k_split - 1) / k_split;
+    const uint k_begin = k_part * chunk;
+    const uint k_end = min(tile_k, k_begin + chunk);
+
+    ACC a00 = ZERO, a01 = ZERO, a02 = ZERO, a03 = ZERO;
+    ACC a10 = ZERO, a11 = ZERO, a12 = ZERO, a13 = ZERO;
+    ACC a20 = ZERO, a21 = ZERO, a22 = ZERO, a23 = ZERO;
+    ACC a30 = ZERO, a31 = ZERO, a32 = ZERO, a33 = ZERO;
+
+    uvec4 code = uvec4(0);
+    uvec4 x0 = uvec4(0), x1 = uvec4(0);
+    if (k_begin < k_end) {
+        if (decode_live) {
+            code = trellis_load8((decode_base + k_begin) * TILE_WORDS, word_index);
+        }
+        x0 = act4[act_row + 2 * k_begin];
+        x1 = act4[act_row + 2 * k_begin + 1];
+    }
+
+    uint buf = 0;
+    for (uint kb = k_begin; kb < k_end; ++kb) {
+        // stage this step: decoded weights and activations into buffer buf
+        if (decode_live) {
+            uvec4 lo, hi;
+            trellis_states8_from(code, 8 * lane, lo, hi);
+            // states 0-3 of the lane are row lane / 4, columns c, c + 1, c + 8, c + 9 (c = 2 x (lane % 4)); 4-7 the
+            // same columns 8 rows below: two FP16 values per word
+            const uint w_base = (buf * ROW_TILES + sg) * 128 + (lane / 4) * 8 + lane % 4;
+            sw[w_base] = packHalf2x16(vec2(trellis_value4x(lo.x), trellis_value4x(lo.y)));
+            sw[w_base + 4] = packHalf2x16(vec2(trellis_value4x(lo.z), trellis_value4x(lo.w)));
+            sw[w_base + 64] = packHalf2x16(vec2(trellis_value4x(hi.x), trellis_value4x(hi.y)));
+            sw[w_base + 68] = packHalf2x16(vec2(trellis_value4x(hi.z), trellis_value4x(hi.w)));
+        }
+        sx[(buf * TOKENS + tid) * 2] = x0;
+        sx[(buf * TOKENS + tid) * 2 + 1] = x1;
+        barrier();
+
+        // read the next step from global memory while this one multiplies
+        if (kb + 1 < k_end) {
+            if (decode_live) {
+                code = trellis_load8((decode_base + kb + 1) * TILE_WORDS, word_index);
+            }
+            x0 = act4[act_row + 2 * (kb + 1)];
+            x1 = act4[act_row + 2 * (kb + 1) + 1];
+        }
+
+        BMAT b0, b1, b2, b3;
+        const uint x_base = (buf * TOKENS + 64 * wn) * 2;
+        coopMatLoad(b0, sx, x_base, 2, gl_CooperativeMatrixLayoutColumnMajor);
+        coopMatLoad(b1, sx, x_base + 32, 2, gl_CooperativeMatrixLayoutColumnMajor);
+        coopMatLoad(b2, sx, x_base + 64, 2, gl_CooperativeMatrixLayoutColumnMajor);
+        coopMatLoad(b3, sx, x_base + 96, 2, gl_CooperativeMatrixLayoutColumnMajor);
+        const uint w_tile = (buf * ROW_TILES + 4 * wm) * 128;
+#define MMA_ROW(I, C0, C1, C2, C3) \
+        { \
+            AMAT a; \
+            coopMatLoad(a, sw, w_tile + I * 128, 8, gl_CooperativeMatrixLayoutRowMajor); \
+            C0 = coopMatMulAdd(a, b0, C0); \
+            C1 = coopMatMulAdd(a, b1, C1); \
+            C2 = coopMatMulAdd(a, b2, C2); \
+            C3 = coopMatMulAdd(a, b3, C3); \
+        }
+        MMA_ROW(0, a00, a01, a02, a03)
+        MMA_ROW(1, a10, a11, a12, a13)
+        MMA_ROW(2, a20, a21, a22, a23)
+        MMA_ROW(3, a30, a31, a32, a33)
+        buf ^= 1;
+    }
+
+    // each token scale applies to every row (times 1/4 for the weights stored as 4 x value); the host dispatches only
+    // full 256-token chunks
+    const uint token0 = 64 * wn;
+    ACC f0, f1, f2, f3;
+    const uint scale_base = 4 * chunk_z * p.chunk_stride + TOKENS * p.k / 2;
+    coopMatLoad(f0, inv_m, scale_base + token0, 0, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(f1, inv_m, scale_base + token0 + 16, 0, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(f2, inv_m, scale_base + token0 + 32, 0, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(f3, inv_m, scale_base + token0 + 48, 0, gl_CooperativeMatrixLayoutRowMajor);
+    const uint out_base = (k_part * p.batch + TOKENS * chunk_z + token0) * p.n + (row_tile0 + 4 * wm) * 16;
+#define STORE(I, T, C, F) \
+    if (4 * wm + I < row_tiles) { \
+        [[unroll]] for (uint e = 0; e < C.length(); ++e) { \
+            C[e] *= F[e] * 0.25; \
+        } \
+        coopMatStore(C, y, out_base + T * 16 * p.n + I * 16, p.n, gl_CooperativeMatrixLayoutColumnMajor); \
+    }
+    STORE(0, 0, a00, f0) STORE(0, 1, a01, f1) STORE(0, 2, a02, f2) STORE(0, 3, a03, f3)
+    STORE(1, 0, a10, f0) STORE(1, 1, a11, f1) STORE(1, 2, a12, f2) STORE(1, 3, a13, f3)
+    STORE(2, 0, a20, f0) STORE(2, 1, a21, f1) STORE(2, 2, a22, f2) STORE(2, 3, a23, f3)
+    STORE(3, 0, a30, f0) STORE(3, 1, a31, f1) STORE(3, 2, a32, f2) STORE(3, 3, a33, f3)
+}

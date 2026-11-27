@@ -854,6 +854,48 @@ void process_shaders() {
 
     string_to_spv("get_rows_i32", "get_rows.comp", {{"TEMP_TYPE", "uint"}, {"A_TYPE", "uint"}, {"B_TYPE", "int"}, {"D_TYPE", "uint"}});
 
+    string_to_spv("trellis_input", "trellis_io.comp", {{"TRELLIS_INPUT", "1"}});
+    string_to_spv("trellis_output", "trellis_io.comp", {});
+    string_to_spv("trellis_fused_in", "trellis_fused.comp", {{"TRELLIS_FUSED_IN", "1"}});
+    string_to_spv("trellis_fused_in_q8", "trellis_fused.comp", {{"TRELLIS_FUSED_IN", "1"}, {"TRELLIS_FUSED_Q8", "1"}});
+    string_to_spv("trellis_fused_in_q8_packed", "trellis_fused.comp", {{"TRELLIS_FUSED_IN", "1"}, {"TRELLIS_FUSED_Q8", "1"}, {"TRELLIS_Q8_PACKED", "1"}});
+    string_to_spv("trellis_fused_out", "trellis_fused.comp", {{"TRELLIS_FUSED_OUT", "1"}});
+    string_to_spv("trellis_chain", "trellis_chain.comp", {});
+    string_to_spv("trellis_out128", "trellis_out128.comp", {});
+    string_to_spv("trellis_decode_rows", "trellis_io.comp", {{"TRELLIS_DECODE_ROWS", "1"}});
+    string_to_spv("trellis_store_rows", "trellis_io.comp", {{"TRELLIS_STORE_ROWS", "1"}});
+    string_to_spv("trellis_matvec", "trellis_product.comp", {{"TRELLIS_MATVEC", "1"}});
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+    string_to_spv("trellis_matvec_q8", "trellis_product.comp", {{"TRELLIS_MATVEC_Q8", "1"}, {"TRELLIS_Q8_TOKENS", "1"}});
+    string_to_spv("trellis_matvec_q8x4", "trellis_product.comp", {{"TRELLIS_MATVEC_Q8", "1"}, {"TRELLIS_Q8_TOKENS", "4"}});
+    string_to_spv("trellis_matvec_q8x4_packed", "trellis_product.comp", {{"TRELLIS_MATVEC_Q8", "1"}, {"TRELLIS_Q8_TOKENS", "4"}, {"TRELLIS_Q8_PACKED", "1"}});
+    string_to_spv("trellis_quant_packed", "trellis_quant.comp", {{"TRELLIS_Q8_PACKED", "1"}});
+#endif
+    string_to_spv("trellis_quant", "trellis_quant.comp", {});
+    string_to_spv("trellis_reduce", "trellis_reduce.comp", {});
+    string_to_spv("trellis_prep16", "trellis_prep16.comp", {});
+    string_to_spv("trellis_matmul", "trellis_product.comp", {});
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+    string_to_spv("trellis_verify", "trellis_verify_cm.comp", {}, true, true);
+    string_to_spv("trellis_verify_i32", "trellis_verify_cm.comp", {{"TRELLIS_VERIFY_I32", "1"}}, true, true);
+    string_to_spv("trellis_quant_i32", "trellis_quant.comp", {{"TRELLIS_VERIFY_I32", "1"}, {"TRELLIS_Q8_PACKED", "1"}});
+    string_to_spv("trellis_verify16", "trellis_verify16_cm.comp", {}, true, true);
+    string_to_spv("trellis_verify16_i32", "trellis_verify16_cm.comp", {{"TRELLIS_VERIFY_I32", "1"}}, true, true);
+#endif
+    string_to_spv("trellis_matmul", "trellis_product.comp", {{"TRELLIS_COOPMAT", "1"}}, true, true);
+    string_to_spv("trellis_prep16_wide", "trellis_prep16.comp", {{"TRELLIS_MM_WIDE", "1"}});
+    string_to_spv("trellis_prep16_in", "trellis_prep16_in.comp", {});
+    string_to_spv("trellis_mm", "trellis_matmul_cm.comp", {}, true, true);
+    string_to_spv("trellis_mm_wide", "trellis_matmul_cm.comp", {{"TRELLIS_MM_WIDE", "1"}}, true, true);
+    string_to_spv("trellis_mm_big", "trellis_mm_big.comp", {}, true, true);
+    string_to_spv("trellis_mm_res", "trellis_matmul_cm.comp", {{"TRELLIS_MM_RESIDUAL", "1"}}, true, true);
+#endif
+    string_to_spv("trellis_block", "trellis_transform.comp", {{"TRELLIS_BLOCK", "1"}});
+    string_to_spv("trellis_block_shuffle", "trellis_transform.comp", {{"TRELLIS_BLOCK", "1"}, {"TRELLIS_BLOCK_SHUFFLE", "1"}});
+    string_to_spv("trellis_butterfly", "trellis_transform.comp", {});
+    string_to_spv("trellis_cross", "trellis_transform.comp", {{"TRELLIS_CROSS", "1"}});
+
     string_to_spv("mul_mat_vec_p021_f16_f32_subgroup_add", "mul_mat_vec_p021.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});
     string_to_spv("mul_mat_vec_p021_f16_f32",              "mul_mat_vec_p021.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}});
     string_to_spv("mul_mat_vec_nc_f16_f32", "mul_mat_vec_nc.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}});

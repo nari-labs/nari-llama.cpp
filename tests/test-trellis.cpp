@@ -178,21 +178,22 @@ static void run_device(ggml_backend_t backend, int bits, int mode, int columns) 
 }
 
 
-static std::vector<float> run_hybrid(ggml_backend_t device, ggml_backend_t cpu, int columns, bool bands) {
+static std::vector<float> run_hybrid(ggml_backend_t device, ggml_backend_t cpu, int columns, bool bands, bool offload_embedding = false) {
     constexpr int K = 256, N = 128;
     auto * host = ggml_init({1024*1024, nullptr, true});
     auto * weights = ggml_init({1024*1024, nullptr, true});
     auto * ctx = ggml_init({4*1024*1024, nullptr, true});
     check(host && weights && ctx, "hybrid context allocation failed");
-    auto weight = [](ggml_context * c, int bits) {
+    auto weight = [K, N](ggml_context * c, int bits) {
         return std::vector<ggml_tensor *>{
             ggml_new_tensor_2d(c, static_cast<ggml_type>(GGML_TYPE_TRL1 + bits - 1), K, N),
             ggml_new_tensor_1d(c, GGML_TYPE_F16, K/16),
             ggml_new_tensor_1d(c, GGML_TYPE_F32, K), ggml_new_tensor_1d(c, GGML_TYPE_F32, N)};
     };
-    auto emb = weight(host, 2), head = weight(weights, 3), head2 = weight(weights, 6);
+    auto * embedding_ctx = offload_embedding ? weights : host;
+    auto emb = weight(embedding_ctx, 2), head = weight(weights, 3), head2 = weight(weights, 6);
     auto * ids = ggml_new_tensor_1d(host, GGML_TYPE_I32, columns);
-    auto * gather = ggml_new_tensor_1d(host, GGML_TYPE_I32, 2*N);
+    auto * gather = ggml_new_tensor_1d(embedding_ctx, GGML_TYPE_I32, 2*N);
     auto * vocab = ggml_new_tensor_1d(weights, GGML_TYPE_I32, 2*N);
     const int32_t ed[] = {0, 0, 1, 1, 128, 1, 1, N};
     ggml_tensor * e;
@@ -202,9 +203,8 @@ static std::vector<float> run_hybrid(ggml_backend_t device, ggml_backend_t cpu, 
     } else {
         e = ggml_trellis_get_rows(ctx, emb[0], ids, emb[1], emb[2], emb[3], ed, 8);
     }
-    if (device != cpu && ggml_backend_supports_op(device, e)) {
-        std::fprintf(stderr, "%s advertises coded embeddings\n", ggml_backend_name(device));
-        std::exit(1);
+    if (offload_embedding) {
+        check(ggml_backend_supports_op(device, e), "device does not support the coded embedding");
     }
     const int32_t d[] = {1, 128, 1, 1, 128, 1, 1, N};
     auto * a = ggml_trellis_mul_mat(ctx, head[0], e, head[1], head[2], head[3], nullptr, nullptr, d, 8);
@@ -246,8 +246,13 @@ static std::vector<float> run_hybrid(ggml_backend_t device, ggml_backend_t cpu, 
     ggml_backend_tensor_set(vocab, perm.data(), 0, perm.size()*sizeof(int32_t));
     ggml_backend_t backends[] = {device, cpu};
     auto * sched = ggml_backend_sched_new(backends, nullptr, device == cpu ? 1 : 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
+    if (!offload_embedding) {
+        for (auto * band = e; band != nullptr; band = band->src[6]) {
+            ggml_backend_sched_set_tensor_backend(sched, band, cpu);
+        }
+    }
     check(ggml_backend_sched_alloc_graph(sched, graph), "hybrid graph allocation failed");
-    check(ggml_backend_sched_get_tensor_backend(sched, e) == cpu, "embedding fallback was not assigned to CPU");
+    check(ggml_backend_sched_get_tensor_backend(sched, e) == (offload_embedding ? device : cpu), "coded embedding placement mismatch");
     check(ggml_backend_sched_get_tensor_backend(sched, a) == device, "coded head did not offload");
     check(ggml_backend_sched_get_tensor_backend(sched, b) == device, "second coded head did not offload");
     check(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS, "hybrid graph failed");
@@ -269,6 +274,11 @@ int main(int argc, char ** argv) {
         if (std::string(argv[i]) == "-v") {
             verbose = true;
         } else if (device == cpu) {
+            if (std::string(argv[i]) == "Vulkan0" && ggml_backend_dev_by_name(argv[i]) == nullptr) {
+                ggml_backend_free(cpu);
+                std::puts("Vulkan0 is unavailable");
+                return 77;
+            }
             device = ggml_backend_init_by_name(argv[i], nullptr);
             check(device != nullptr, "requested backend unavailable");
             if (ggml_backend_dev_type(ggml_backend_get_device(device)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
@@ -315,14 +325,20 @@ int main(int argc, char ** argv) {
             for (int columns : {1, 7, 35}) { run_device(device, bits, mode, columns); }
         }
     }
+    const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(device));
+    const bool vulkan = std::string(ggml_backend_reg_name(reg)) == "Vulkan";
     for (bool bands : {false, true}) {
-        for (int columns : {1, 7, 35}) {
+        for (int columns : {1, 7, 35, 129}) {
             auto expected = run_hybrid(cpu, cpu, columns, bands);
             auto actual = run_hybrid(device, cpu, columns, bands);
             for (size_t i = 0; i < actual.size(); ++i) { check_close(actual[i], expected[i]); }
+            if (vulkan) {
+                auto offloaded = run_hybrid(device, cpu, columns, bands, true);
+                for (size_t i = 0; i < offloaded.size(); ++i) { check_close(offloaded[i], expected[i]); }
+            }
         }
     }
     if (device != cpu) { ggml_backend_free(device); }
     ggml_backend_free(cpu);
-    std::puts("TRL1-6: CPU embeddings/bands and backend products/transforms/permutations/batches passed");
+    std::puts("TRL1-6: embeddings, bands, products, transforms, permutations and batches passed");
 }

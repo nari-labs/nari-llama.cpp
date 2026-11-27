@@ -1,0 +1,49 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+// The output block transform (blocks of 128) and the output scale of a Trellis product in one launch, without
+// gathers: one workgroup of 8 subgroups (32 lanes) per token. Each subgroup transforms whole blocks in registers as in
+// trellis_prep16_in.comp, with the same rounding steps as trellis_transform.comp followed by trellis_io.comp.
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Parameters {
+    uint n;
+    uint first;
+    uint post_offset;
+    uint dst_offset;
+} p;
+
+layout(binding = 0) readonly buffer Product { float src[]; };
+layout(binding = 1) readonly buffer Post { float post[]; };
+layout(binding = 2) writeonly buffer Result { float dst[]; };
+
+const uint LEN = 128;
+
+float shuffle_steps(float value, uint lane) {
+    [[unroll]] for (uint step = 1; step < 32; step *= 2) {
+        const float other = subgroupShuffleXor(value, step);
+        value = (lane & step) == 0 ? value + other : other - value;
+    }
+    return value;
+}
+
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint local_token = gl_WorkGroupID.x;
+    const uint blocks = p.n / LEN;
+    const float norm = 1.0 / sqrt(float(LEN));
+    for (uint b = gl_SubgroupID; b < blocks; b += 8) {
+        vec4 w;
+        [[unroll]] for (uint c = 0; c < 4; ++c) {
+            w[c] = shuffle_steps(src[local_token * p.n + b * LEN + lane + 32 * c], lane);
+        }
+        w = vec4(w.x + w.y, w.x - w.y, w.z + w.w, w.z - w.w);
+        w = vec4(w.x + w.z, w.y + w.w, w.x - w.z, w.y - w.w);
+        [[unroll]] for (uint c = 0; c < 4; ++c) {
+            const uint i = b * LEN + lane + 32 * c;
+            dst[p.dst_offset + (p.first + local_token) * p.n + i] = (w[c] * norm) * post[p.post_offset + i];
+        }
+    }
+}

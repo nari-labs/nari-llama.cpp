@@ -3,6 +3,7 @@
 #include "common.h"
 #include "ggml.h"
 #include "ggml-cpp.h"
+#include "gguf.h"
 #include "llama.h"
 #include "log.h"
 #include "ngram-cache.h"
@@ -3022,6 +3023,21 @@ const std::vector<double> & common_speculative_get_synth_probs(const common_spec
     return spec->synth_probs;
 }
 
+// whether a GGUF carries trellis-coded tensors (NariQ: trellis.version, nariq/FORMAT.md); reads the header only
+static bool common_gguf_has_trellis(const std::string & path) {
+    if (path.empty()) {
+        return false;
+    }
+    gguf_init_params gparams = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+    gguf_context * ctx = gguf_init_from_file(path.c_str(), gparams);
+    if (ctx == nullptr) {
+        return false;
+    }
+    const bool trellis = gguf_find_key(ctx, "trellis.version") >= 0;
+    gguf_free(ctx);
+    return trellis;
+}
+
 common_params common_base_params_to_speculative(const common_params & params) {
     const bool has_draft = params.speculative.has_dft();
 
@@ -3078,6 +3094,15 @@ common_params common_base_params_to_speculative(const common_params & params) {
                    t == COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR;
         });
     if (has_block_draft) {
+        // the block-draft graph computes the head for every token of the ubatch and is reserved for n_ubatch tokens;
+        // it decodes n_max + 1 tokens per sequence, so 64 is plenty. With the Trellis head of NariQ (all 248320 logits
+        // in frequency bands, then reordered) a 512-token reserve took 1437 MiB, 213 MiB at 64 (RX 9070, peak VRAM of
+        // the OpenClaw setup 15.0 GiB + 0.9 GiB shared -> 14.6 GiB + 0.2 GiB). Only for a trellis-coded target: with a
+        // plain head the larger micro-batch keeps the draft's prompt pass faster (Unsloth UD-Q2_K_XL: 2.5K-token
+        // prefill 716 t/s at 512 against 662 at 64).
+        if (common_gguf_has_trellis(params.model.path)) {
+            result.n_ubatch = std::min<int32_t>(result.n_ubatch, 64);
+        }
         // per-seq output positions: DFlash decodes anchor + n_max masks (n_max + 1); DSpark n_max -> +1 covers both
         const int32_t per_seq = std::max(1, params_spec.n_max + 1);
         result.n_outputs_max = params.n_parallel * per_seq;

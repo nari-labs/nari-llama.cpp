@@ -1683,13 +1683,16 @@ ggml_tensor * llm_graph_context::build_rope_indexer(ggml_tensor * cur, ggml_tens
 
 // trellis fork: the logits of a coded lm_head in frequency bands: every band's coded linear, concatenated in band order,
 // then each vocabulary row picked from its band (logits[t] = banded[vocab_gather[t]])
-ggml_tensor * llm_graph_context::build_trellis_bands(ggml_tensor * cur) const {
+ggml_tensor * llm_graph_context::build_trellis_bands(ggml_tensor * cur, const llama_model * weights_model) const {
+    // the head of this graph's model, or of another one (the target of a DFlash draft)
+    const llama_model & wm = weights_model ? *weights_model : model;
+    GGML_ASSERT(!wm.trellis.bands.empty());
     ggml_tensor * banded = nullptr;
     if (ggml_nrows(cur) == 1) {
         // one token: concatenate pairwise, so each band is copied log2(n_bands) times instead of up to n_bands times
         std::vector<ggml_tensor *> level;
-        for (ggml_tensor * w : model.trellis.bands) {
-            level.push_back(build_lora_mm(w, cur));
+        for (ggml_tensor * w : wm.trellis.bands) {
+            level.push_back(build_lora_mm(w, cur, nullptr, &wm));
         }
         while (level.size() > 1) {
             size_t n = 0;
@@ -1700,27 +1703,28 @@ ggml_tensor * llm_graph_context::build_trellis_bands(ggml_tensor * cur) const {
         }
         banded = level.front();
     } else {
-        for (ggml_tensor * w : model.trellis.bands) {
-            ggml_tensor * y = build_lora_mm(w, cur);
+        for (ggml_tensor * w : wm.trellis.bands) {
+            ggml_tensor * y = build_lora_mm(w, cur, nullptr, &wm);
             banded = banded ? ggml_concat(ctx0, banded, y, 0) : y;
         }
     }
     if (banded->ne[1] == 1) {  // one token: the transposes are reshapes
         ggml_tensor * bt = ggml_reshape_2d(ctx0, banded, 1, banded->ne[0]);
-        bt = ggml_get_rows(ctx0, bt, model.trellis.vocab_gather);
+        bt = ggml_get_rows(ctx0, bt, wm.trellis.vocab_gather);
         return ggml_reshape_2d(ctx0, bt, bt->ne[1], 1);
     }
     ggml_tensor * bt = ggml_cont(ctx0, ggml_transpose(ctx0, banded));  // [n_tokens, n_vocab]
-    bt = ggml_get_rows(ctx0, bt, model.trellis.vocab_gather);          // rows in vocabulary order
+    bt = ggml_get_rows(ctx0, bt, wm.trellis.vocab_gather);          // rows in vocabulary order
     return ggml_cont(ctx0, ggml_transpose(ctx0, bt));                  // [n_vocab, n_tokens]
 }
 
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
-          ggml_tensor * w_s) const {
+          ggml_tensor * w_s,
+    const llama_model * weights_model) const {
     // trellis fork: a trellis-coded weight runs as one coded linear (its rotations, scales and gathers included)
-    if (const llama_trellis_weight * tw = model.trellis_weight(w)) {
+    if (const llama_trellis_weight * tw = (weights_model ? *weights_model : model).trellis_weight(w)) {
         ggml_tensor * x = ggml_is_contiguous(cur) ? cur : ggml_cont(ctx0, cur);
         ggml_tensor * res = ggml_trellis_mul_mat(ctx0, w, x, tw->s16, tw->pre, tw->post, tw->pin, tw->pout,
                                                  tw->desc.data(), (int) tw->desc.size());
@@ -2714,6 +2718,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cb(moe_out, "ffn_moe_out", il);
 
     return moe_out;
+}
+
+ggml_tensor * llm_graph_context::build_token_rows(ggml_tensor * tok_embd, ggml_tensor * ids, const llama_model * weights_model) const {
+    const llama_model & wm = weights_model ? *weights_model : model;
+    if (tok_embd != nullptr) {
+        const auto * tw = wm.trellis_weight(tok_embd);
+        return tw ? ggml_trellis_get_rows(ctx0, tok_embd, ids, tw->s16, tw->pre, tw->post, tw->desc.data(), (int) tw->desc.size())
+                  : ggml_get_rows(ctx0, tok_embd, ids);
+    }
+    GGML_ASSERT(!wm.trellis.embed_bands.empty() && wm.trellis.embed_gather != nullptr);
+    ggml_tensor * rows = nullptr;
+    int64_t row0 = 0;
+    for (ggml_tensor * w : wm.trellis.embed_bands) {
+        const auto * tw = wm.trellis_weight(w);
+        rows = ggml_trellis_get_rows_band(ctx0, rows, w, ids, wm.trellis.embed_gather, row0,
+                                          tw->s16, tw->pre, tw->post, tw->desc.data(), (int) tw->desc.size());
+        row0 += w->ne[1];
+    }
+    return rows;
 }
 
 // input embeddings with optional lora

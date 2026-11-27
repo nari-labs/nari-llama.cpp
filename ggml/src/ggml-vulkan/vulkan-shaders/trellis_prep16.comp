@@ -1,0 +1,87 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// Prepares the activations of a Trellis prompt-batch product for trellis_matmul_cm: the rotated inputs times the
+// tile scale of their column (one per 16 inputs), times a power of two per token that brings the largest value of
+// the token to at most 2^14, as an FP16 value and its FP16 rounding residual times 2^11 (the residual term keeps the
+// product as exact as the F32 path; the power of two keeps the small values out of the FP16 subnormals). The inverse
+// of the power of two is stored for the output. The wide chunk stores only the main FP16 term.
+// One workgroup per token prepares the activations or zeros the padding for the product.
+layout(local_size_x = 256) in;
+layout(binding = 0) readonly buffer Activations { float x[]; };
+layout(binding = 1) readonly buffer Scales { float16_t scales[]; };
+layout(binding = 2) writeonly buffer Act { float16_t act[]; };
+layout(binding = 2) writeonly buffer ActScale { float inv_m[]; };
+
+layout(push_constant) uniform Parameters {
+    uint k;
+    uint n;
+    uint batch;
+    uint scale_offset;
+} p;
+
+#ifdef TRELLIS_MM_WIDE
+const uint TOKENS = 256;
+#else
+const uint TOKENS = 128;
+#endif
+shared float amax_part[256];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint token = gl_WorkGroupID.x;
+    const uint base = token * p.k;
+    // the residuals follow the FP16 values of all 128 tokens, then the per-token scales
+#ifdef TRELLIS_MM_WIDE
+    const uint scale_base = TOKENS * p.k / 2;
+#else
+    const uint lo_base = TOKENS * p.k;
+    const uint scale_base = TOKENS * p.k;
+#endif
+    if (token >= p.batch) {
+        for (uint i = tid; i < p.k; i += 256) {
+            act[base + i] = float16_t(0.0);
+#ifndef TRELLIS_MM_WIDE
+            act[lo_base + base + i] = float16_t(0.0);
+#endif
+        }
+        if (tid == 0) {
+            inv_m[scale_base + token] = 0.0;
+        }
+        return;
+    }
+    float amax = 0.0;
+    for (uint i = tid; i < p.k; i += 256) {
+        amax = max(amax, abs(x[base + i] * float(scales[p.scale_offset + i / 16])));
+    }
+    amax_part[tid] = amax;
+    barrier();
+    [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            amax_part[tid] = max(amax_part[tid], amax_part[tid + s]);
+        }
+        barrier();
+    }
+    amax = amax_part[0];
+    // m = 2^(14 - ceil(log2(amax))), so that amax * m <= 2^14
+    int e = 0;
+    if (amax > 0.0) {
+        int ex;
+        frexp(amax, ex);
+        e = clamp(14 - ex, -100, 100);
+    }
+    const float m = ldexp(1.0, e);
+    for (uint i = tid; i < p.k; i += 256) {
+        const float v = x[base + i] * float(scales[p.scale_offset + i / 16]) * m;
+        const float16_t hi = float16_t(v);
+        act[base + i] = hi;
+#ifndef TRELLIS_MM_WIDE
+        act[lo_base + base + i] = float16_t((v - float(hi)) * 2048.0);
+#endif
+    }
+    if (tid == 0) {
+        inv_m[scale_base + token] = ldexp(1.0, -e);
+    }
+}

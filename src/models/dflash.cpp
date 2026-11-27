@@ -356,7 +356,9 @@ ggml_tensor * llama_model_dflash::graph_base::build_inp_tokens() {
 ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tokens) {
     const float kq_scale = hparams.f_attention_scale != 0.0f ? hparams.f_attention_scale : 1.0f/sqrtf(float(n_embd_head));
 
-    ggml_tensor * inpL = ggml_get_rows(ctx0, get_tok_embd(*this, model), inp_tokens);
+    // the target embedding may be trellis-coded or banded (NariQ): look it up with its own operators
+    const llama_model & embedding_model = model.tok_embd ? model : *llama_get_model(cparams.ctx_other);
+    ggml_tensor * inpL = build_token_rows(embedding_model.tok_embd, inp_tokens, &embedding_model);
     if (hparams.f_embedding_scale != 0.0f) {
         inpL = ggml_scale(ctx0, inpL, hparams.f_embedding_scale);
     }
@@ -465,8 +467,10 @@ ggml_tensor * llama_model_dflash::graph_base::build_layers(ggml_tensor * inp_tok
 }
 
 ggml_tensor * llama_model_dflash::graph_base::build_logits(ggml_tensor * cur) {
-    const auto [output, output_s] = get_lm_head(*this, model);
-    cur = build_lora_mm(output, cur, output_s);
+    // the target head may be trellis-coded or banded (NariQ): run it with its own operators
+    const llama_model & head_model = model.output ? model : *llama_get_model(cparams.ctx_other);
+    cur = head_model.output ? build_lora_mm(head_model.output, cur, head_model.output_s, &head_model)
+                            : build_trellis_bands(cur, &head_model);
 
     // DFlash2 feeds these logits to the selector, so they need the target's output
     // transforms; DFlash1 and DSpark read them through the sampler instead

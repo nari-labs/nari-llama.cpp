@@ -1,0 +1,88 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+// The middle of a Trellis MLP chain in one launch (the fused MLP chain of nari-labs/nari-llama.cpp#5): from the raw
+// products of gate and up (still in the rotated output basis), the output block transform and scale of each, SwiGLU,
+// then the input scale and block transform of down. One workgroup per block and token; the result is the rotated
+// input of down. All three transforms use the same block length (blocks of up to 2048, no gathers). The first five
+// butterfly steps run in subgroup shuffles (32 lanes) as in trellis_transform.comp (TRELLIS_BLOCK_SHUFFLE).
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Parameters {
+    uint n;
+    uint len;
+    uint gate;
+    uint up;
+    uint post_gate;
+    uint post_up;
+    uint pre_down;
+    uint dst;
+    float scale;
+} p;
+
+layout(binding = 0) readonly buffer Gate { float gate[]; };
+layout(binding = 1) readonly buffer Up { float up[]; };
+layout(binding = 2) readonly buffer PostGate { float post_gate[]; };
+layout(binding = 3) readonly buffer PostUp { float post_up[]; };
+layout(binding = 4) readonly buffer PreDown { float pre_down[]; };
+layout(binding = 5) writeonly buffer Result { float dst[]; };
+
+const uint BLOCK_LIMIT = 2048;
+shared float values_g[BLOCK_LIMIT];
+shared float values_u[BLOCK_LIMIT];
+
+float shuffle_steps(float value, uint i) {
+    [[unroll]] for (uint step = 1; step < 32; step *= 2) {
+        const float other = subgroupShuffleXor(value, step);
+        value = (i & step) == 0 ? value + other : other - value;
+    }
+    return value;
+}
+
+void main() {
+    const uint tid = 32 * gl_SubgroupID + gl_SubgroupInvocationID;
+    const uint base = gl_WorkGroupID.x * p.len;
+    const uint row = gl_WorkGroupID.y * p.n + base;
+
+    for (uint i = tid; i < p.len; i += gl_WorkGroupSize.x) {
+        values_g[i] = shuffle_steps(gate[p.gate + row + i], i);
+        values_u[i] = shuffle_steps(up[p.up + row + i], i);
+    }
+    barrier();
+    for (uint step = 32; step < p.len; step *= 2) {
+        for (uint j = tid; j < p.len / 2; j += gl_WorkGroupSize.x) {
+            const uint i = (j / step) * (2 * step) + j % step;
+            const float g0 = values_g[i], g1 = values_g[i + step];
+            values_g[i] = g0 + g1;
+            values_g[i + step] = g0 - g1;
+            const float u0 = values_u[i], u1 = values_u[i + step];
+            values_u[i] = u0 + u1;
+            values_u[i + step] = u0 - u1;
+        }
+        barrier();
+    }
+
+    // each thread reads back the entries it writes, so the lanes keep the order the shuffles need
+    for (uint i = tid; i < p.len; i += gl_WorkGroupSize.x) {
+        const float g = values_g[i] * p.scale * post_gate[p.post_gate + base + i];
+        const float u = values_u[i] * p.scale * post_up[p.post_up + base + i];
+        const float h = g / (1.0 + exp(-g)) * u;
+        values_g[i] = shuffle_steps(h * pre_down[p.pre_down + base + i], i);
+    }
+    barrier();
+    for (uint step = 32; step < p.len; step *= 2) {
+        for (uint j = tid; j < p.len / 2; j += gl_WorkGroupSize.x) {
+            const uint i = (j / step) * (2 * step) + j % step;
+            const float x = values_g[i], y = values_g[i + step];
+            values_g[i] = x + y;
+            values_g[i + step] = x - y;
+        }
+        barrier();
+    }
+    for (uint i = tid; i < p.len; i += gl_WorkGroupSize.x) {
+        dst[p.dst + row + i] = values_g[i] * p.scale;
+    }
+}

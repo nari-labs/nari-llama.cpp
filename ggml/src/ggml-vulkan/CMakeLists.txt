@@ -73,6 +73,8 @@ if (Vulkan_FOUND)
                              ggml-vulkan-buffers.cpp
                              ggml-vulkan-comm.cpp
                              ggml-vulkan-debug.cpp
+                             ggml-vulkan-trellis.cpp
+                             ggml-vulkan-trellis.h
                             )
 
     # hide symbols, so dlclosed duplicate copies cannot interpose them

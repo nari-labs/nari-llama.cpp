@@ -1,0 +1,282 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
+#ifdef TRELLIS_COOPMAT
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#pragma use_vulkan_memory_model
+#endif
+#ifdef TRELLIS_MATVEC_Q8
+#extension GL_EXT_integer_dot_product : require
+#endif
+
+#include "trellis_decode.glsl"
+
+#ifndef TRELLIS_MATVEC_Q8
+layout(binding = 2) readonly buffer Activations { float x[]; };
+#endif
+layout(binding = 3) writeonly buffer Result { float y[]; };
+
+layout(push_constant) uniform Parameters {
+    uint k;
+    uint n;
+    uint batch;
+    uint scale_offset;
+} p;
+
+#if defined(TRELLIS_MATVEC_Q8)
+// Each workgroup computes 16 outputs for up to MAX_TOKENS. The replicated path uses a dot4 per weight and token.
+// The packed path sums each weight first and uses a mixed-sign dot4 for four weights and four int8 activations.
+// Both apply the -126 bias through the sum of the activations.
+#ifndef TRELLIS_Q8_TOKENS
+#define TRELLIS_Q8_TOKENS 4
+#endif
+const uint MAX_TOKENS = TRELLIS_Q8_TOKENS;
+layout(local_size_x = 128) in;
+#ifdef TRELLIS_Q8_PACKED
+layout(binding = 2) readonly buffer Packed { uint packed[]; };
+
+uint trellis_pack_weights(uvec4 states) {
+    uint weights = 0;
+    [[unroll]] for (uint j = 0; j < 4; ++j) {
+        const uint value = dotPacked4x8EXT(trellis_bytes(states[j]), 0x01010101u);
+        weights |= value << (8 * j);
+    }
+    return weights;
+}
+#else
+layout(binding = 2) readonly buffer Reps { uvec4 reps[]; };
+#endif
+layout(binding = 2) readonly buffer Meta { uvec2 qmeta[]; };
+shared float partial_lo[MAX_TOKENS * 128];
+shared float partial_hi[MAX_TOKENS * 128];
+
+void main() {
+    // k < 2^31: the shifted bit is always zero
+    trellis_hash_init(p.k >> 31);
+    const uint thread_id = gl_LocalInvocationID.x;
+    const uint lane = thread_id % 32;
+    const uint split = thread_id / 32;
+    const uint tile_k = p.k / 16;
+    const uint tile_base = gl_WorkGroupID.x * tile_k;
+#ifdef TRELLIS_Q8_PACKED
+    const uint meta_base = p.batch * tile_k * 2;
+#else
+    const uint meta_base = p.batch * tile_k * 8;
+#endif
+    // k split over gl_NumWorkGroups.y workgroups for products with few outputs: each writes its partial sums to its
+    // own slice of y, which trellis_reduce adds up
+    const uint k_split = gl_NumWorkGroups.y;
+    const uint k_part = gl_WorkGroupID.y;
+    const uint chunk = (tile_k + k_split - 1) / k_split;
+    const uint col_end = min(tile_k, (k_part + 1) * chunk);
+    float sum_lo[MAX_TOKENS];
+    float sum_hi[MAX_TOKENS];
+    [[unroll]] for (uint t = 0; t < MAX_TOKENS; ++t) {
+        sum_lo[t] = 0.0;
+        sum_hi[t] = 0.0;
+    }
+    for (uint tile_col = k_part * chunk + split; tile_col < col_end; tile_col += 4) {
+        const uint tile = (tile_base + tile_col) * TILE_WORDS;
+        const float scale = float(scales[p.scale_offset + tile_col]);
+        uvec4 s_lo, s_hi;
+        if (MAX_TOKENS == 1 && BITS <= 4) {
+            trellis_states8(tile, 8 * lane, s_lo, s_hi);
+        } else {
+            s_lo = trellis_states4(tile, 8 * lane);
+            s_hi = trellis_states4(tile, 8 * lane + 4);
+        }
+#ifdef TRELLIS_Q8_PACKED
+        const uint b_lo = trellis_pack_weights(s_lo);
+        const uint b_hi = trellis_pack_weights(s_hi);
+#else
+        // the four 6-bit bytes of each state times 4 (no shift, as grid_value4 in nari-labs/nari-llama.cpp#7): the
+        // dot products below give 4 x (value + 126) per weight, which the bias and the factor 1/4 undo
+        uvec4 b_lo, b_hi;
+        [[unroll]] for (uint j = 0; j < 4; ++j) {
+            b_lo[j] = trellis_bytes4(s_lo[j]);
+            b_hi[j] = trellis_bytes4(s_hi[j]);
+        }
+#endif
+        [[unroll]] for (uint t = 0; t < MAX_TOKENS; ++t) {
+            if (t < p.batch) {
+                const uint index = (t * tile_k + tile_col) * 4 + lane % 4;
+                const uvec2 meta = qmeta[meta_base + index];
+#ifdef TRELLIS_Q8_PACKED
+                const int a = int(packed[index]);
+                const int acc_lo = dotPacked4x8EXT(a, b_lo);
+                const int acc_hi = dotPacked4x8EXT(a, b_hi);
+                const int bias = 126 * int(meta.x);
+                const float f = scale * uintBitsToFloat(meta.y);
+#else
+                const uvec4 a = reps[index];
+                // chained through the accumulator of the dot product (no separate adds); no overflow: |sum| < 2^20
+                int acc_lo = 0;
+                int acc_hi = 0;
+                [[unroll]] for (uint j = 0; j < 4; ++j) {
+                    acc_lo = dotPacked4x8AccSatEXT(int(a[j]), b_lo[j], acc_lo);
+                    acc_hi = dotPacked4x8AccSatEXT(int(a[j]), b_hi[j], acc_hi);
+                }
+                const int bias = int(meta.x);
+                const float f = 0.25 * scale * uintBitsToFloat(meta.y);
+#endif
+                sum_lo[t] = fma(float(acc_lo - bias), f, sum_lo[t]);
+                sum_hi[t] = fma(float(acc_hi - bias), f, sum_hi[t]);
+            }
+        }
+    }
+    [[unroll]] for (uint t = 0; t < MAX_TOKENS; ++t) {
+        partial_lo[t * 128 + thread_id] = sum_lo[t];
+        partial_hi[t * 128 + thread_id] = sum_hi[t];
+    }
+    barrier();
+    const uint token = thread_id / 16;
+    const uint row_out = thread_id % 16;
+    if (token < p.batch) {
+        const uint row = 4 * (row_out % 8);
+        float sum = 0.0;
+        [[unroll]] for (uint j = 0; j < 4; ++j) {
+            [[unroll]] for (uint c = 0; c < 4; ++c) {
+                const uint i = token * 128 + 32 * j + row + c;
+                sum += row_out < 8 ? partial_lo[i] : partial_hi[i];
+            }
+        }
+        y[(k_part * p.batch + token) * p.n + 16 * gl_WorkGroupID.x + row_out] = sum;
+    }
+}
+#elif defined(TRELLIS_MATVEC)
+layout(local_size_x = 128) in;
+shared float partial_lo[128];
+shared float partial_hi[128];
+
+void main() {
+    // k < 2^31: the shifted bit is always zero
+    trellis_hash_init(p.k >> 31);
+    const uint thread_id = gl_LocalInvocationID.x;
+    const uint lane = thread_id % 32;
+    const uint split = thread_id / 32;
+    const uint tile_k = p.k / 16;
+    const uint tile_base = gl_WorkGroupID.x * tile_k;
+    const uint token = gl_WorkGroupID.y;
+    vec4 sum_lo = vec4(0.0);
+    vec4 sum_hi = vec4(0.0);
+    for (uint tile_col = split; tile_col < tile_k; tile_col += 4) {
+        const uint tile = (tile_base + tile_col) * TILE_WORDS;
+        const float scale = float(scales[p.scale_offset + tile_col]);
+        const uint col = token * p.k + 16 * tile_col + 2 * (lane % 4);
+        const vec4 a = vec4(x[col], x[col + 1], x[col + 8], x[col + 9]) * scale;
+        sum_lo = fma(trellis_decode4(tile, 8 * lane), a, sum_lo);
+        sum_hi = fma(trellis_decode4(tile, 8 * lane + 4), a, sum_hi);
+    }
+    partial_lo[thread_id] = dot(sum_lo, vec4(1.0));
+    partial_hi[thread_id] = dot(sum_hi, vec4(1.0));
+    barrier();
+    if (thread_id < 16) {
+        const uint row = 4 * (thread_id % 8);
+        float sum = 0.0;
+        [[unroll]] for (uint j = 0; j < 4; ++j) {
+            [[unroll]] for (uint c = 0; c < 4; ++c) {
+                const uint i = 32 * j + row + c;
+                sum += thread_id < 8 ? partial_lo[i] : partial_hi[i];
+            }
+        }
+        y[token * p.n + 16 * gl_WorkGroupID.x + thread_id] = sum;
+    }
+}
+#elif defined(TRELLIS_COOPMAT)
+layout(local_size_x_id = 1) in;
+
+const uint SUBGROUPS = 4;
+const uint TOKEN_TILE = 16 * SUBGROUPS;
+shared float16_t weights[256];
+shared float16_t act_hi[256 * SUBGROUPS];
+shared float16_t act_lo[256 * SUBGROUPS];
+shared float result[256 * SUBGROUPS];
+
+void main() {
+    // k < 2^31: the shifted bit is always zero
+    trellis_hash_init(p.k >> 31);
+    const uint tid = gl_LocalInvocationID.x;
+    const uint token_start = TOKEN_TILE * gl_WorkGroupID.y;
+    const uint tile_k = p.k / 16;
+    const uint tile_base = gl_WorkGroupID.x * tile_k;
+    const uint group_offset = 256 * gl_SubgroupID;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> sum =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> residual =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    for (uint tile_col = 0; tile_col < tile_k; ++tile_col) {
+        const float scale = float(scales[p.scale_offset + tile_col]);
+        if (tid < 32) {
+            const uint tile = (tile_base + tile_col) * TILE_WORDS;
+            const vec4 lo = trellis_decode4(tile, 8 * tid);
+            const vec4 hi = trellis_decode4(tile, 8 * tid + 4);
+            [[unroll]] for (uint i = 0; i < 4; ++i) {
+                const uint col = 2 * (tid % 4) + i % 2 + 8 * (i / 2);
+                const uint pos = (tid / 4) * 16 + col;
+                weights[pos] = float16_t(lo[i]);
+                weights[pos + 128] = float16_t(hi[i]);
+            }
+        }
+        for (uint i = tid; i < TOKEN_TILE * 16; i += gl_WorkGroupSize.x) {
+            const uint token = token_start + i / 16;
+            const float value = token < p.batch ? x[token * p.k + tile_col * 16 + i % 16] : 0.0;
+            const float scaled = value * scale;
+            const float16_t hi = float16_t(scaled);
+            // Keep the FP16 rounding residual and scale it away from subnormals.
+            act_hi[i] = hi;
+            act_lo[i] = float16_t((scaled - float(hi)) * 1024.0);
+        }
+        barrier();
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+        coopMatLoad(a, weights, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(b, act_hi, group_offset, 16, gl_CooperativeMatrixLayoutColumnMajor);
+        sum = coopMatMulAdd(a, b, sum);
+        coopMatLoad(b, act_lo, group_offset, 16, gl_CooperativeMatrixLayoutColumnMajor);
+        residual = coopMatMulAdd(a, b, residual);
+        barrier();
+    }
+    sum += residual * (1.0 / 1024.0);
+    coopMatStore(sum, result, group_offset, 16, gl_CooperativeMatrixLayoutColumnMajor);
+    barrier();
+    for (uint i = tid; i < TOKEN_TILE * 16; i += gl_WorkGroupSize.x) {
+        const uint token = token_start + i / 16;
+        if (token < p.batch) {
+            y[token * p.n + 16 * gl_WorkGroupID.x + i % 16] = result[i];
+        }
+    }
+}
+#else
+layout(local_size_x = 256) in;
+shared float weights[256];
+shared float activations[256];
+
+void main() {
+    // k < 2^31: the shifted bit is always zero
+    trellis_hash_init(p.k >> 31);
+    const uint thread_id = gl_LocalInvocationID.x;
+    const uint row = thread_id % 16;
+    const uint col = thread_id / 16;
+    const uint token = 16 * gl_WorkGroupID.y + col;
+    const uint tile_k = p.k / 16;
+    const uint tile_base = gl_WorkGroupID.x * tile_k;
+    float sum = 0.0;
+    for (uint tile_col = 0; tile_col < tile_k; ++tile_col) {
+        const uint tile = (tile_base + tile_col) * TILE_WORDS;
+        weights[thread_id] = trellis_value(tile, row, col) * float(scales[p.scale_offset + tile_col]);
+        activations[thread_id] = token < p.batch ? x[token * p.k + 16 * tile_col + row] : 0.0;
+        barrier();
+        for (uint j = 0; j < 16; ++j) {
+            sum = fma(weights[16 * j + row], activations[16 * col + j], sum);
+        }
+        barrier();
+    }
+    if (token < p.batch) {
+        y[token * p.n + 16 * gl_WorkGroupID.x + row] = sum;
+    }
+}
+#endif

@@ -1,0 +1,123 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+
+// The input and output stages of a Trellis product in one launch each, for block Hadamard transforms (kind 1, blocks
+// of up to 4096): one workgroup per block and token.
+// TRELLIS_FUSED_IN: input gather and scale (trellis_io.comp, TRELLIS_INPUT), the block transform
+// (trellis_transform.comp, TRELLIS_BLOCK), then either the rotated FP32 values or, with TRELLIS_FUSED_Q8, their int8
+// quantization for the decode and verify products (trellis_quant.comp, with TRELLIS_Q8_PACKED for the packed layout).
+// TRELLIS_FUSED_OUT: the block transform of the product and the output scale (trellis_io.comp without gather).
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform Parameters {
+    uint k;
+    uint n;
+    uint first;
+    uint offsets[7];
+    uint strides[3];
+    uint ne1;
+    uint ne2;
+    uint use_gather;
+    uint len;
+    uint batch;
+    float scale;
+} p;
+
+layout(binding = 0) readonly buffer Input { float src[]; };
+layout(binding = 1) readonly buffer Scale { float scale[]; };
+layout(binding = 2) readonly buffer Gather { uint gather[]; };
+#if defined(TRELLIS_FUSED_IN) && defined(TRELLIS_FUSED_Q8)
+#ifdef TRELLIS_Q8_PACKED
+layout(binding = 3) writeonly buffer Packed { uint packed[]; };
+#else
+layout(binding = 3) writeonly buffer Reps { uvec4 reps[]; };
+#endif
+layout(binding = 3) writeonly buffer Meta { uvec2 qmeta[]; };
+#else
+layout(binding = 3) writeonly buffer Output { float dst[]; };
+#endif
+
+const uint BLOCK_LIMIT = 4096;
+shared float block_values[BLOCK_LIMIT];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint shard = gl_WorkGroupID.x;
+    const uint local_token = gl_WorkGroupID.y;
+    const uint token = p.first + local_token;
+    const uint base = shard * p.len;
+
+#ifdef TRELLIS_FUSED_IN
+    const uint offset = (token % p.ne1) * p.strides[0] + (token / p.ne1 % p.ne2) * p.strides[1] + (token / (p.ne1 * p.ne2)) * p.strides[2];
+    for (uint i = tid; i < p.len; i += gl_WorkGroupSize.x) {
+        const uint idx = base + i;
+        const uint j = p.use_gather != 0 ? gather[p.offsets[2] + idx] : idx;
+        block_values[i] = src[p.offsets[0] + offset + j] * scale[p.offsets[1] + idx];
+    }
+#else
+    for (uint i = tid; i < p.len; i += gl_WorkGroupSize.x) {
+        block_values[i] = src[local_token * p.k + base + i];
+    }
+#endif
+    barrier();
+    for (uint step = 1; step < p.len; step *= 2) {
+        for (uint j = tid; j < p.len / 2; j += gl_WorkGroupSize.x) {
+            const uint i = (j / step) * (2 * step) + j % step;
+            const float x = block_values[i];
+            const float y = block_values[i + step];
+            block_values[i] = x + y;
+            block_values[i + step] = x - y;
+        }
+        barrier();
+    }
+
+#if defined(TRELLIS_FUSED_IN) && defined(TRELLIS_FUSED_Q8)
+    // int8 per 16 inputs, as trellis_quant.comp
+    const uint groups = p.k / 16;
+#ifdef TRELLIS_Q8_PACKED
+    const uint meta_base = p.batch * groups * 2;
+#else
+    const uint meta_base = p.batch * groups * 8;
+#endif
+    for (uint gl = tid; gl < p.len / 16; gl += gl_WorkGroupSize.x) {
+        float v[16];
+        float amax = 0.0;
+        [[unroll]] for (uint i = 0; i < 16; ++i) {
+            v[i] = block_values[16 * gl + i] * p.scale;
+            amax = max(amax, abs(v[i]));
+        }
+        const float d = amax / 127.0;
+        const float id = amax > 0.0 ? 127.0 / amax : 0.0;
+        int q[16];
+        [[unroll]] for (uint i = 0; i < 16; ++i) {
+            q[i] = clamp(int(round(v[i] * id)), -127, 127);
+        }
+        const uint g = base / 16 + gl;
+        [[unroll]] for (uint lq = 0; lq < 4; ++lq) {
+            const int c0 = q[2 * lq], c1 = q[2 * lq + 1], c2 = q[2 * lq + 8], c3 = q[2 * lq + 9];
+            const uint index = (local_token * groups + g) * 4 + lq;
+#ifdef TRELLIS_Q8_PACKED
+            packed[index] = uint(c0 & 0xff) | (uint(c1 & 0xff) << 8) | (uint(c2 & 0xff) << 16) | (uint(c3 & 0xff) << 24);
+#else
+            reps[index] = uvec4(uint(c0 & 0xff) * 0x01010101u, uint(c1 & 0xff) * 0x01010101u,
+                                uint(c2 & 0xff) * 0x01010101u, uint(c3 & 0xff) * 0x01010101u);
+#endif
+#ifdef TRELLIS_Q8_PACKED
+            qmeta[meta_base + index] = uvec2(uint(c0 + c1 + c2 + c3), floatBitsToUint(d));
+#else
+            // the replicated layout feeds trellis_matvec_q8, which takes 504 x the sum (4 x the -126 of the values)
+            qmeta[meta_base + index] = uvec2(uint(504 * (c0 + c1 + c2 + c3)), floatBitsToUint(d));
+#endif
+        }
+    }
+#elif defined(TRELLIS_FUSED_IN)
+    for (uint i = tid; i < p.len; i += gl_WorkGroupSize.x) {
+        dst[local_token * p.k + base + i] = block_values[i] * p.scale;
+    }
+#else
+    for (uint i = tid; i < p.len; i += gl_WorkGroupSize.x) {
+        dst[p.offsets[3] + token * p.k + base + i] = block_values[i] * p.scale * scale[p.offsets[1] + base + i];
+    }
+#endif
+}

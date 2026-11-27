@@ -1,0 +1,135 @@
+#version 450
+
+#ifdef TRELLIS_BLOCK_SHUFFLE
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : require
+#endif
+
+layout(local_size_x = 256) in;
+layout(binding = 0) buffer Vectors { float values[]; };
+#ifdef TRELLIS_CROSS
+layout(binding = 1) writeonly buffer Result { float result[]; };
+#endif
+
+layout(push_constant) uniform Parameters {
+    uint width;
+    uint len;
+    uint run;
+    uint m;
+    uint shards;
+    uint nparts;
+    uint parts[8];
+    uint step;
+    uint inverse;
+    float scale;
+} p;
+
+#ifdef TRELLIS_BLOCK
+const uint BLOCK_LIMIT = 4096;
+shared float block_values[BLOCK_LIMIT];
+
+void main() {
+#ifdef TRELLIS_BLOCK_SHUFFLE
+    const uint tid = 32 * gl_SubgroupID + gl_SubgroupInvocationID;
+    const uint first_step = 32;
+#else
+    const uint tid = gl_LocalInvocationID.x;
+    const uint first_step = 1;
+#endif
+    const uint base = gl_WorkGroupID.y * p.width + gl_WorkGroupID.x * p.len;
+    for (uint i = tid; i < p.len; i += gl_WorkGroupSize.x) {
+#ifdef TRELLIS_BLOCK_SHUFFLE
+        float value = values[base + i];
+        [[unroll]] for (uint step = 1; step < 32; step *= 2) {
+            const float other = subgroupShuffleXor(value, step);
+            value = (i & step) == 0 ? value + other : other - value;
+        }
+        block_values[i] = value;
+#else
+        block_values[i] = values[base + i];
+#endif
+    }
+    barrier();
+    for (uint step = first_step; step < p.len; step *= 2) {
+        for (uint j = tid; j < p.len / 2; j += gl_WorkGroupSize.x) {
+            const uint i = (j / step) * (2 * step) + j % step;
+            const float x = block_values[i];
+            const float y = block_values[i + step];
+            block_values[i] = x + y;
+            block_values[i + step] = x - y;
+        }
+        barrier();
+    }
+    for (uint i = tid; i < p.len; i += gl_WorkGroupSize.x) {
+        values[base + i] = block_values[i] * p.scale;
+    }
+}
+#else
+// A fused tensor stores each part's shards together. The transform sees one shard from each part.
+uint stored(uint index, uint shard) {
+    if (p.nparts == 0) {
+        return shard * p.len + index;
+    }
+    uint start = 0;
+    for (uint part = 0; part < p.nparts; ++part) {
+        const uint size = p.parts[part] / p.shards;
+        if (index < size) {
+            return start + shard * size + index;
+        }
+        index -= size;
+        start += p.parts[part];
+    }
+    return start;
+}
+
+#ifdef TRELLIS_CROSS
+int paley_sign(uint row, uint col) {
+    if (row == col || row == 0) {
+        return 1;
+    }
+    if (col == 0) {
+        return -1;
+    }
+    const uint q = p.m - 1;
+    const uint diff = (col + q - row) % q;
+    for (uint i = 1; i <= q / 2; ++i) {
+        if (i * i % q == diff) {
+            return 1;
+        }
+    }
+    return -1;
+}
+#endif
+
+void main() {
+    const uint index = gl_GlobalInvocationID.x;
+    const uint shard = gl_WorkGroupID.y;
+    const uint base = gl_WorkGroupID.z * p.width;
+#ifdef TRELLIS_CROSS
+    if (index >= p.len) {
+        return;
+    }
+    const uint row = index / p.run;
+    const uint col = index % p.run;
+    float sum = 0.0;
+    for (uint j = 0; j < p.m; ++j) {
+        const int sign = p.inverse != 0 ? paley_sign(j, row) : paley_sign(row, j);
+        const float value = values[base + stored(j * p.run + col, shard)];
+        sum += sign > 0 ? value : -value;
+    }
+    result[base + stored(index, shard)] = sum * p.scale;
+#else
+    if (index >= p.len / 2) {
+        return;
+    }
+    const uint i = (index / p.step) * (2 * p.step) + index % p.step;
+    const uint a = base + stored(i, shard);
+    const uint b = base + stored(i + p.step, shard);
+    const float x = values[a];
+    const float y = values[b];
+    values[a] = (x + y) * p.scale;
+    values[b] = (x - y) * p.scale;
+#endif
+}
+#endif

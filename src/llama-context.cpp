@@ -249,14 +249,15 @@ llama_context::llama_context(
             }
             cparams.ctx_other = params.ctx_other;
 
-            // the draft reads the target's embedding and lm_head with plain get_rows / mul_mat, which a trellis-coded
-            // tensor does not support and a banded one (left null) does not have
             const llama_model * target = llama_get_model(params.ctx_other);
-            auto shareable = [](const ggml_tensor * t) { return t != nullptr && !ggml_is_trellis_type(t->type); };
-            if ((model.tok_embd == nullptr && !shareable(target->tok_embd)) ||
-                (model.output   == nullptr && !shareable(target->output))) {
+            const bool coded_supported = model.arch == LLM_ARCH_DFLASH;
+            auto shareable = [coded_supported](const ggml_tensor * t, bool banded) {
+                return t ? coded_supported || !ggml_is_trellis_type(t->type) : coded_supported && banded;
+            };
+            if ((model.tok_embd == nullptr && !shareable(target->tok_embd, !target->trellis.embed_bands.empty())) ||
+                (model.output   == nullptr && !shareable(target->output, !target->trellis.bands.empty()))) {
                 throw std::runtime_error(model.arch_name() + " needs the target model's token embedding and output, "
-                        "but the target has no plain one to share (missing, or trellis-coded)");
+                        "but the target has no compatible tensors to share");
             }
         } else if (model.arch == LLM_ARCH_DFLASH) {
             // used to read the target's layer input device buffer

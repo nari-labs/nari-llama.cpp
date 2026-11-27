@@ -1,0 +1,104 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#ifdef TRELLIS_VERIFY_I32
+#extension GL_EXT_shader_16bit_storage : require
+#endif
+
+// Quantizes the rotated activations of a Trellis product to int8 for trellis_matvec_q8, with one scale per 16
+// inputs (one tile column), absmax / 127. For tile column g and lane group q, reps holds the four inputs that the
+// lanes with lane % 4 == q multiply (columns 2q, 2q + 1, 2q + 8 and 2q + 9 of the tile), each byte replicated four
+// times, so that one dot4 with the four 6-bit bytes of a state gives the input times the byte sum. The packed variant
+// stores the four int8 values in one word. qmeta holds their sum and scale in both layouts.
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer Activations { float x[]; };
+#ifdef TRELLIS_Q8_PACKED
+layout(binding = 1) writeonly buffer Packed { uint packed[]; };
+#else
+layout(binding = 1) writeonly buffer Reps { uvec4 reps[]; };
+#endif
+layout(binding = 1) writeonly buffer Meta { uvec2 qmeta[]; };
+#ifdef TRELLIS_VERIFY_I32
+layout(binding = 2) readonly buffer Scales { float16_t scales[]; };
+#endif
+
+layout(push_constant) uniform Parameters {
+    uint k;
+    uint n;
+    uint batch;
+    uint scale_offset;
+} p;
+
+void main() {
+    const uint groups = p.k / 16;
+#ifdef TRELLIS_VERIFY_I32
+    // Fold the per-tile weight scales into the activations before sharing an int8 scale.
+    const uint block = gl_GlobalInvocationID.x;
+    const uint token = gl_GlobalInvocationID.y;
+    if (block >= groups / 2) {
+        return;
+    }
+    const uint g0 = block * 2;
+    const uint base = token * p.k + 16 * g0;
+    float amax = 0.0;
+    for (uint j = 0; j < 2; ++j) {
+        const float s = float(scales[p.scale_offset + g0 + j]);
+        [[unroll]] for (uint i = 0; i < 16; ++i) {
+            amax = max(amax, abs(s * x[base + j * 16 + i]));
+        }
+    }
+    const float inv = amax > 0.0 ? 127.0 / amax : 0.0;
+    int sum = 0;
+    for (uint j = 0; j < 2; ++j) {
+        const float inv_scaled = inv * float(scales[p.scale_offset + g0 + j]);
+        [[unroll]] for (uint lq = 0; lq < 4; ++lq) {
+            const uint i = base + j * 16 + 2 * lq;
+            const ivec4 q = clamp(ivec4(round(vec4(x[i], x[i + 1], x[i + 8], x[i + 9]) * inv_scaled)), -127, 127);
+            sum += q.x + q.y + q.z + q.w;
+            const uvec4 bytes = uvec4(q) & 255u;
+            packed[(token * groups + g0 + j) * 4 + lq] = bytes.x | (bytes.y << 8) | (bytes.z << 16) | (bytes.w << 24);
+        }
+    }
+    // the sum of the block's 32 int8 values, for the bias of trellis_verify16_cm.comp
+    qmeta[p.batch * groups * 2 + token * (groups / 2) + block] = uvec2(uint(sum), floatBitsToUint(amax / 127.0));
+#else
+    const uint g = gl_GlobalInvocationID.x;
+    const uint token = gl_GlobalInvocationID.y;
+    if (g >= groups) {
+        return;
+    }
+    const uint base = token * p.k + 16 * g;
+    float v[16];
+    float amax = 0.0;
+    [[unroll]] for (uint i = 0; i < 16; ++i) {
+        v[i] = x[base + i];
+        amax = max(amax, abs(v[i]));
+    }
+    const float d = amax / 127.0;
+    const float id = amax > 0.0 ? 127.0 / amax : 0.0;
+    int q[16];
+    [[unroll]] for (uint i = 0; i < 16; ++i) {
+        q[i] = clamp(int(round(v[i] * id)), -127, 127);
+    }
+#ifdef TRELLIS_Q8_PACKED
+    const uint meta_base = p.batch * groups * 2;
+#else
+    const uint meta_base = p.batch * groups * 8;
+#endif
+    [[unroll]] for (uint lq = 0; lq < 4; ++lq) {
+        const int c0 = q[2 * lq], c1 = q[2 * lq + 1], c2 = q[2 * lq + 8], c3 = q[2 * lq + 9];
+        const uint index = (token * groups + g) * 4 + lq;
+#ifdef TRELLIS_Q8_PACKED
+        packed[index] = uint(c0 & 0xff) | (uint(c1 & 0xff) << 8) | (uint(c2 & 0xff) << 16) | (uint(c3 & 0xff) << 24);
+#else
+        reps[index] = uvec4(uint(c0 & 0xff) * 0x01010101u, uint(c1 & 0xff) * 0x01010101u,
+                            uint(c2 & 0xff) * 0x01010101u, uint(c3 & 0xff) * 0x01010101u);
+#endif
+#ifdef TRELLIS_Q8_PACKED
+        qmeta[meta_base + index] = uvec2(uint(c0 + c1 + c2 + c3), floatBitsToUint(d));
+#else
+        // the replicated layout feeds trellis_matvec_q8, which takes 504 x the sum (4 x the -126 of the values)
+        qmeta[meta_base + index] = uvec2(uint(504 * (c0 + c1 + c2 + c3)), floatBitsToUint(d));
+#endif
+    }
+#endif
+}

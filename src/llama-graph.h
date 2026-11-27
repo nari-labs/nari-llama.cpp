@@ -1128,10 +1128,11 @@ struct llm_graph_context {
     ggml_tensor * build_lora_mm(
               ggml_tensor * w,
               ggml_tensor * cur,
-              ggml_tensor * w_s = nullptr) const;
+              ggml_tensor * w_s = nullptr,
+          const llama_model * weights_model = nullptr) const;
 
     // trellis fork: the logits of a coded lm_head in frequency bands (llama_trellis::bands)
-    ggml_tensor * build_trellis_bands(ggml_tensor * cur) const;
+    ggml_tensor * build_trellis_bands(ggml_tensor * cur, const llama_model * weights_model = nullptr) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
     // if slots is set, the experts are selected by slots instead of ids, from the MoE cache if cached (see llama_moe_cache::build_lookup)
@@ -1253,6 +1254,10 @@ struct llm_graph_context {
 
     // tok_scale: applied to token rows only
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd, float tok_scale = 1.0f) const;
+
+    // trellis fork: rows of a token embedding of weights_model (plain, coded or banded); weights_model may be another
+    // model than this graph's, e.g. the target of a DFlash draft
+    ggml_tensor * build_token_rows(ggml_tensor * tok_embd, ggml_tensor * ids, const llama_model * weights_model) const;
 
     // the state input of an MTP graph: rows of the h_nextn device buffer of ctx_state_src (see llama_set_ctx_state_src()),
     // or uploaded from ubatch.embd_state
